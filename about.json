@@ -1,7 +1,0 @@
-{
-    "name": "discourse-rumx-utm",
-    "about": "Adds UTM parameters to all outgoing links in posts",
-    "version": "1.0.0",
-    "authors": ["Oliver Gerhardt"],
-    "url": "https://github.com/Oliver530/discourse-rumx-utm"
-  }
