@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable) + adds UTM to external links
-# version: 2.0.3
+# version: 2.0.4
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -15,13 +15,15 @@ after_initialize do
       require 'uri'
       require 'rack/utils'
 
-      # RX + 1-6 digits, no leading zero. Catalog range verified 1..26189 (max 5
-      # digits, RX1-RX9 are real rums); {0,5} = 1-6 digits gives growth headroom.
-      # Lookarounds, not \b: Ruby \b treats "_" as a word char and mishandles
-      # URL/email punctuation. (?<![[:alnum:]_]) / (?![[:alnum:]_]) require the
-      # match to be a standalone token, so "TRX900", "BRX12", "RX9883abc",
-      # "_RX9883" do not match. Case-insensitive: users type rx / Rx / RX.
-      RX_REGEX = /(?<![[:alnum:]_])RX([1-9][0-9]{0,5})(?![[:alnum:]_])/i
+      # RX + 1-5 digits, no leading zero. Catalog range verified 1..26189
+      # (RX1-RX9 are real rums); {0,4} = 1-5 digits (RX1..RX99999) gives ~4x
+      # growth headroom over the current max while rejecting absurd 6+ digit
+      # typos that would link to a 404. Lookarounds, not \b: Ruby \b treats "_"
+      # as a word char and mishandles URL/email punctuation.
+      # (?<![[:alnum:]_]) / (?![[:alnum:]_]) require the match to be a
+      # standalone token, so "TRX900", "BRX12", "RX9883abc", "_RX9883" do not
+      # match. Case-insensitive: users type rx / Rx / RX.
+      RX_REGEX = /(?<![[:alnum:]_])RX([1-9][0-9]{0,4})(?![[:alnum:]_])/i
 
       # Never linkify inside these. <a> guards idempotency (no nested anchors on
       # rebake); code/pre/etc are verbatim; onebox/quote are not the author's own
@@ -100,6 +102,10 @@ after_initialize do
           return false
         end
         return false if uri.host.blank?
+        # Only ever touch http(s). Defense-in-depth against odd schemes that
+        # still carry a host (e.g. javascript://host/...). Discourse sanitizes
+        # cooked hrefs, but we never want to rewrite a non-web scheme.
+        return false unless %w[http https].include?(uri.scheme&.downcase)
         begin
           current_host = URI.parse(Discourse.base_url).host
         rescue
@@ -109,11 +115,13 @@ after_initialize do
       end
 
       def self.add_utm_params(url)
-        begin
-          uri = URI.parse(url)
-        rescue StandardError
-          return url # malformed href: leave untouched, never crash the pipeline
-        end
+        # Method-level rescue covers the WHOLE body, not just URI.parse:
+        # Rack::Utils.parse_nested_query raises Rack::QueryParser errors (NOT a
+        # URI::Error) on malformed/adversarial query strings like
+        # "?a=1&a[b]=2". An uncaught error here aborts the entire
+        # post_process_cooked handler before linkify runs (same failure mode as
+        # the v2.0.2 mailto bug). Any failure: return the href untouched.
+        uri = URI.parse(url)
         canonicalize_rumx!(uri)
         params = Rack::Utils.parse_nested_query(uri.query)
         params.merge!(
@@ -123,6 +131,8 @@ after_initialize do
         )
         uri.query = Rack::Utils.build_nested_query(params)
         uri.to_s
+      rescue StandardError
+        url
       end
 
       # Canonicalize author-typed rumx.com links to match the site's canonical
@@ -138,7 +148,9 @@ after_initialize do
         return unless host == "rumx.com" || host == "www.rumx.com"
         uri.host = "rumx.com"
         path = uri.path.to_s
-        if !path.empty? && !path.end_with?("/") && !File.basename(path).include?(".")
+        if path.empty?
+          uri.path = "/" # https://rumx.com -> https://rumx.com/
+        elsif !path.end_with?("/") && !File.basename(path).include?(".")
           uri.path = path + "/" # skip files like /sitemap.xml, /img/x.jpg
         end
       end
