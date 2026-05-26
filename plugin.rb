@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable) + adds UTM to external links
-# version: 2.0.2
+# version: 2.0.3
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -114,6 +114,7 @@ after_initialize do
         rescue StandardError
           return url # malformed href: leave untouched, never crash the pipeline
         end
+        canonicalize_rumx!(uri)
         params = Rack::Utils.parse_nested_query(uri.query)
         params.merge!(
           "utm_source"   => "rumx",
@@ -122,6 +123,24 @@ after_initialize do
         )
         uri.query = Rack::Utils.build_nested_query(params)
         uri.to_s
+      end
+
+      # Canonicalize author-typed rumx.com links to match the site's canonical
+      # form (and the clean form the RX auto-linker emits): strip the "www."
+      # host prefix and ensure a trailing slash on non-file paths. rumx.com
+      # (Hugo) serves trailing-slash URLs and 301s www -> apex, so this only
+      # removes a redirect hop and keeps forum links consistent. Mutates uri
+      # in place; no-op for non-rumx hosts. Only the UTM pass calls this, so
+      # the RX auto-links (created after, already canonical) are untouched.
+      def self.canonicalize_rumx!(uri)
+        return unless uri.host
+        host = uri.host.downcase
+        return unless host == "rumx.com" || host == "www.rumx.com"
+        uri.host = "rumx.com"
+        path = uri.path.to_s
+        if !path.empty? && !path.end_with?("/") && !File.basename(path).include?(".")
+          uri.path = path + "/" # skip files like /sitemap.xml, /img/x.jpg
+        end
       end
     end
   end
