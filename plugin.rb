@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable) + adds UTM to external links
-# version: 2.0.0
+# version: 2.0.1
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -48,18 +48,23 @@ after_initialize do
           next unless text.match?(RX_REGEX)
           next if skip_text_node?(text_node)
 
+          # Deterministic scan: Regexp#match(text, pos) returns MatchData directly.
+          # Do NOT use text.to_enum(:scan, RX_REGEX) + Regexp.last_match — $~ set
+          # inside scan's internal block does not reliably propagate through the
+          # enumerator's Fiber, so last_match can be nil/stale and skip matches
+          # intermittently. (Observed: ~3/7589 posts silently unlinked on rebake.)
           replacements = []
           last = 0
-          text.to_enum(:scan, RX_REGEX).each do
-            m = Regexp.last_match
-            if m.begin(0) > last
-              replacements << Nokogiri::XML::Text.new(text[last...m.begin(0)], text_node.document)
-            end
+          pos = 0
+          while (m = RX_REGEX.match(text, pos))
+            s, e = m.begin(0), m.end(0)
+            replacements << Nokogiri::XML::Text.new(text[last...s], text_node.document) if s > last
             a = Nokogiri::XML::Node.new("a", text_node.document)
             a["href"] = "https://rumx.com/en/rums/#{m[1]}/" # stable ID-URL, no slug, no UTM
             a.content = m[0]                                # anchor = exactly as typed (auto-escaped)
             replacements << a
-            last = m.end(0)
+            last = e
+            pos = (e == s ? e + 1 : e) # guard against zero-width (defensive)
           end
           replacements << Nokogiri::XML::Text.new(text[last..], text_node.document) if last < text.length
 
