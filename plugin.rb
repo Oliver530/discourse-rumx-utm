@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable) + adds UTM to external links
-# version: 2.0.1
+# version: 2.0.2
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -88,7 +88,15 @@ after_initialize do
       def self.external_link?(href)
         begin
           uri = URI.parse(href)
-        rescue URI::InvalidURIError
+        rescue StandardError
+          # URI.parse raises a family of errors on malformed hrefs:
+          # URI::InvalidURIError AND URI::InvalidComponentError (siblings, not
+          # parent/child) plus ArgumentError on some inputs. A user-posted
+          # malformed mailto (e.g. "mailto:W.k,1985@gmx.de") raised an
+          # uncaught InvalidComponentError here, aborting the whole
+          # post_process_cooked handler and silently skipping RX linkify for
+          # the entire post. Rescue broadly: an unparseable href is simply
+          # treated as not-external (skip), never crashes the pipeline.
           return false
         end
         return false if uri.host.blank?
@@ -103,8 +111,8 @@ after_initialize do
       def self.add_utm_params(url)
         begin
           uri = URI.parse(url)
-        rescue URI::InvalidURIError
-          return url
+        rescue StandardError
+          return url # malformed href: leave untouched, never crash the pipeline
         end
         params = Rack::Utils.parse_nested_query(uri.query)
         params.merge!(
