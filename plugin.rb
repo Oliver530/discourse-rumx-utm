@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
-# about: Linkifies RXID codes to rumx.com (server-side, crawlable) + adds UTM to external links
-# version: 2.0.4
+# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links
+# version: 2.1.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -31,13 +31,26 @@ after_initialize do
       SKIP_ANCESTOR_TAGS    = %w[a code pre script style textarea kbd samp].freeze
       SKIP_ANCESTOR_CLASSES = %w[onebox quote].freeze
 
+      # The exact href linkify_rx_codes emits: canonical /en/, numeric id,
+      # trailing slash, no query. Three consumers key on this precise shape and
+      # must agree: the UTM pass below (skip), the client-side locale rewrite
+      # (assets/javascripts/discourse/initializers/rumx-rx-locale.js) and the
+      # click-tracking normalizer (TopicLinkClickExtension, bottom of file).
+      RX_LINK_HREF = %r{\Ahttps://rumx\.com/en/rums/[1-9][0-9]{0,4}/\z}
+
       # ---- Pass 1: UTM on existing/author-typed external links (runs FIRST) ----
       # Because linkify runs AFTER this, the RX links we generate below are NOT
-      # seen here and stay clean (no UTM) — intentional, for machine readability.
+      # seen here on a fresh cook and stay clean (no UTM) — intentional, for
+      # machine readability. Not every run is a fresh cook, though: a post
+      # localization can be re-processed from its STORED cooked HTML
+      # (Jobs::ProcessLocalizedCooked without recook, e.g. hashtag remaps), so
+      # this pass can meet anchors an earlier run created. Skip them explicitly;
+      # a UTM'd RX link would no longer match RX_LINK_HREF anywhere.
       def self.process(doc)
         doc.css("a").each do |link|
           href = link.get_attribute("href")
           next if href.blank?
+          next if href.match?(RX_LINK_HREF)
           link.set_attribute("href", add_utm_params(href)) if external_link?(href)
         end
       end
@@ -122,13 +135,24 @@ after_initialize do
         # post_process_cooked handler before linkify runs (same failure mode as
         # the v2.0.2 mailto bug). Any failure: return the href untouched.
         uri = URI.parse(url)
-        canonicalize_rumx!(uri)
+        own_site = canonicalize_rumx!(uri)
         params = Rack::Utils.parse_nested_query(uri.query)
-        params.merge!(
+        forum_utm = {
           "utm_source"   => "rumx",
           "utm_medium"   => "referral",
           "utm_campaign" => "rumx-forum"
-        )
+        }
+        if own_site
+          # rumx.com links that already carry UTM were tagged on purpose by our
+          # own tooling (the Market Radar bot posts utm_campaign=market_radar).
+          # Overwriting those replaced the campaign with "rumx-forum" and left
+          # only utm_content behind, so GA4 never saw the Market Radar traffic
+          # as such. Fill in whatever is missing, never replace what is there.
+          params = forum_utm.merge(params)
+        else
+          # External shops: the forum is the referrer, forum attribution wins.
+          params.merge!(forum_utm)
+        end
         uri.query = Rack::Utils.build_nested_query(params)
         uri.to_s
       rescue StandardError
@@ -142,10 +166,11 @@ after_initialize do
       # removes a redirect hop and keeps forum links consistent. Mutates uri
       # in place; no-op for non-rumx hosts. Only the UTM pass calls this, so
       # the RX auto-links (created after, already canonical) are untouched.
+      # Returns true when the host is rumx.com (own site), false otherwise.
       def self.canonicalize_rumx!(uri)
-        return unless uri.host
+        return false unless uri.host
         host = uri.host.downcase
-        return unless host == "rumx.com" || host == "www.rumx.com"
+        return false unless host == "rumx.com" || host == "www.rumx.com"
         uri.host = "rumx.com"
         path = uri.path.to_s
         if path.empty?
@@ -153,13 +178,60 @@ after_initialize do
         elsif !path.end_with?("/") && !File.basename(path).include?(".")
           uri.path = path + "/" # skip files like /sitemap.xml, /img/x.jpg
         end
+        true
+      end
+    end
+
+    # The client rewrites RX anchors to the viewer's locale (/de/, /fr/ — see
+    # assets/javascripts/discourse/initializers/rumx-rx-locale.js), but the
+    # TopicLink rows are extracted from the STORED cooked HTML and hold the
+    # canonical /en/ href. TopicLinkClick.create_from looks the clicked URL up
+    # by scheme/query variants only, never by path, so a /de/ click would find
+    # no row and silently go uncounted: the per-link click badge in the post
+    # and topic_link_clicks would stop seeing DE/FR readers (26% of RX clicks
+    # in the 90 days before 2026-09-12). Normalize back to /en/ before the
+    # lookup — unless the post genuinely holds that exact /de|fr/ link (an
+    # author-typed one; today all of those carry UTM and never match).
+    #
+    # Return value: core returns the URL it matched (or nil); ClicksController
+    # ignores it, so handing back the /en/ form changes nothing observable.
+    # If core ever renames create_from this override becomes dead code and
+    # DE/FR clicks go uncounted again — a stats regression, never a broken
+    # page. Verify after major upgrades: click an RX link as a non-author with
+    # DE selected, then check TopicLinkClick for that link (24h rate limit per
+    # user/link applies, so use a fresh pair).
+    module TopicLinkClickExtension
+      RX_LOCALE_HREF = %r{\Ahttps://rumx\.com/(?:de|fr)/rums/([1-9][0-9]{0,4})/\z}
+
+      def create_from(args = {})
+        url = args[:url]
+        match = url.is_a?(String) ? RX_LOCALE_HREF.match(url) : nil
+        return super unless match
+        if args[:post_id].present? && ::TopicLink.exists?(post_id: args[:post_id], url: url)
+          return super
+        end
+        super(args.merge(url: "https://rumx.com/en/rums/#{match[1]}/"))
       end
     end
   end
 
+  ::TopicLinkClick.singleton_class.prepend(::DiscourseRUMXUTM::TopicLinkClickExtension)
+
   # Order matters: UTM first (touches author-typed links), then RX-linkify
   # (creates clean, UTM-free identifier links).
   on(:post_process_cooked) do |doc, post|
+    ::DiscourseRUMXUTM::UTMProcessor.process(doc)
+    ::DiscourseRUMXUTM::UTMProcessor.linkify_rx_codes(doc)
+  end
+
+  # Translated posts (content localization / Discourse AI translation) are
+  # cooked separately from the original: LocalizedCookedPostProcessor fires
+  # THIS event, never :post_process_cooked. Without it every localized post
+  # lost its RX links (0 of 14 linked on 2026-09-12) — exactly the posts DE/FR
+  # readers see. Same two passes, same canonical /en/ href: the locale is
+  # applied client-side from the viewer's setting, not from the translation's
+  # language (a DE reader can be shown an untranslated EN original).
+  on(:post_process_localized_cooked) do |doc, post, localization|
     ::DiscourseRUMXUTM::UTMProcessor.process(doc)
     ::DiscourseRUMXUTM::UTMProcessor.linkify_rx_codes(doc)
   end
