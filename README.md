@@ -22,6 +22,30 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
    `utm_medium=referral`, `utm_campaign=rumx-forum`). rumx.com links that
    already carry UTM keep theirs (the Market Radar bot tags its own
    campaign); missing keys are filled, never replaced.
+5. **AI translations stay fresh** (v2.2.0). Core shows a stored translation
+   with no check that it still matches the post, Discourse AI re-translates at
+   most twice a day per post and locale, and its backfill never refreshes an
+   existing translation — on bottle-split posts DE/FR readers saw participant
+   lists several versions old. Now:
+   - every AI translation records an MD5 of the source raw it translated
+     (`PostCustomField rumx_localized_src_md5_<locale>`); a translation is
+     shown only while that digest equals the current raw — `post.version` is
+     not enough, grace-period edits change raw without bumping it. Legacy
+     translations without a digest fall back to the version comparison;
+   - a stale translation is hidden (`ContentLocalization.show_translated_post?`
+     prepend) and the reader gets the original;
+   - `Jobs::RumxRefreshStaleLocalizations` (every 15 min) re-translates what
+     the exact SQL predicate finds stale, at most 12 attempts per run, posts
+     saved in the last 6 min left to the on-edit job; `post_ids:` narrows a
+     run (`Jobs::RumxRefreshStaleLocalizations.new.execute(post_ids: [123])`);
+   - re-translations of unchanged text are skipped before quota is spent
+     (`has_relocalize_quota?` prepend), each translation runs under a
+     per-post/locale `DistributedMutex`, and Discourse AI's
+     `MAX_QUOTA_PER_DAY` is raised 2 → 20.
+   Not covered: topic-list excerpts (topic localizations have no version) and
+   e-mails, which core reads directly. Authors are not exempt from seeing the
+   translation of their own post (core behaviour); one line in
+   `ContentLocalizationExtension` would change that.
 
 The three consumers of the clean RX href shape — the UTM pass (skip), the JS
 rewrite and the click normalizer — key on the same regex. Change one, change
@@ -35,9 +59,23 @@ rebuild, no downtime.
 
 Before deploying, validate the new `plugin.rb` against the live install —
 `script/validate_live.rb` (usage in its header). It exercises both cook
-handlers, idempotence on re-processing, the Market Radar case and the click
-normalizer, inside a rolled-back transaction. Run it again after Discourse
-core upgrades: the click normalizer prepends a core model method.
+handlers, idempotence on re-processing, the Market Radar case, the click
+normalizer, and the translation-freshness path end to end with a STUBBED
+translator (real `Jobs::DetectTranslatePost` and reconciler runs, no LLM
+calls, everything inside a rolled-back transaction), plus an exactness check
+of the SQL staleness predicate against a Ruby scan. Run it again after
+Discourse core or discourse-ai upgrades: the plugin prepends core methods
+(`TopicLinkClick.create_from`, `ContentLocalization.show_translated_post?`,
+`DiscourseAi::Translation::PostLocalizer.localize` / `has_relocalize_quota?`)
+and overrides a discourse-ai constant.
+
+## After deploying 2.2.0
+
+Nothing to run: the reconciler refreshes the existing stale translations on
+its own (12 per 15 min). Check `Rails.logger` for
+`discourse-rumx-utm: re-translated N stale localization(s)` or run
+`Jobs::RumxRefreshStaleLocalizations.stale_localization_ids(limit: 100)` — it
+should trend to empty.
 
 ## After deploying 2.1.0
 
