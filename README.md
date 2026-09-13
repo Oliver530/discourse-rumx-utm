@@ -38,6 +38,10 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
      the exact SQL predicate finds stale, at most 12 attempts per run, posts
      saved in the last 6 min left to the on-edit job; `post_ids:` narrows a
      run (`Jobs::RumxRefreshStaleLocalizations.new.execute(post_ids: [123])`);
+   - a translation shorter than half its source (sources > 300 chars) is
+     discarded and the original shown — Haiku 4.5 reproducibly truncates at a
+     German closing quote („…"); the digest is kept so nothing retries until
+     the post is edited;
    - re-translations of unchanged text are skipped before quota is spent
      (`has_relocalize_quota?` prepend), each translation runs under a
      per-post/locale `DistributedMutex`, and Discourse AI's

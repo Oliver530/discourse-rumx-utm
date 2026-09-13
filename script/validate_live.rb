@@ -153,12 +153,13 @@ if stale_loc && fresh_loc && de_reader
   # ---- real jobs with a STUBBED translator (no LLM calls), inside a rolled-back transaction ----
   ::DiscourseAi::Translation::PostRawTranslator.class_eval do
     def translate
+      return "[stub short]" if $rumx_stub_short
       "[stub #{@target_locale}] #{@text}"
     end
   end
   audit_before = AiApiAuditLog.count
   fp_id = fp.id
-  redis_keys = %w[de fr].flat_map { |l| ["post_relocalized_#{fp_id}_#{l}", tf.lock_key(fp, l)] }
+  redis_keys = %w[de fr en].flat_map { |l| ["post_relocalized_#{fp_id}_#{l}", tf.lock_key(fp, l)] }
   redis_keys.each { |k| Discourse.redis.del(k) }
   I18n.with_locale(:de) do
     reader = Guardian.new(de_reader)
@@ -201,6 +202,22 @@ if stale_loc && fresh_loc && de_reader
       Post.preload_custom_fields([post], ["some_other_plugin_field"])
       state = begin; tf.digest_state(post, "de"); rescue => e; "RAISED #{e.class}"; end
       check.("T5 preloaded proxy without our field -> nil (version fallback), no NotPreloadedError", state.nil?)
+      # T6: implausibly short translation is discarded, digest kept, nothing retries
+      post = Post.find(fp_id)
+      long_raw = post.raw + ("\nLorem ipsum dolor sit amet, consectetur adipiscing elit. " * 8)
+      post.update_columns(raw: long_raw)
+      post = Post.find(fp_id)
+      $rumx_stub_short = true
+      r6 = ::DiscourseAi::Translation::PostLocalizer.localize(post, "fr")
+      $rumx_stub_short = false
+      check.("T6 short translation (< 50% of a > 300-char source) -> discarded, localize returns nil", r6.nil? && post.localizations.reload.find_by(locale: "fr").nil?)
+      check.("T6 digest still recorded -> dedupe blocks retries, SQL predicate finds nothing for fr", tf.digest_state(post, "fr") == true && ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(post, "fr") == false && job.stale_localization_ids(limit: 100, post_ids: [fp_id]).none? { |id| PostLocalization.find(id).locale == "fr" })
+      $rumx_stub_short = false
+      r6b = ::DiscourseAi::Translation::PostLocalizer.localize(post, "fr")
+      check.("T6 normal-length translation of the same source is accepted", r6b && r6b.raw.start_with?("[stub fr]") && tf.fresh?(post, r6b))
+      # T7: a localization in the post's own language is never a reconciler candidate
+      own = PostLocalization.create!(post_id: post.id, locale: post.locale, raw: "x", cooked: "<p>x</p>", post_version: 0, localizer_user_id: -1)
+      check.("T7 same-locale localization (version behind) excluded from the stale query", !job.stale_localization_ids(limit: 100, post_ids: [fp_id]).include?(own.id))
       raise ActiveRecord::Rollback
     end
   end
