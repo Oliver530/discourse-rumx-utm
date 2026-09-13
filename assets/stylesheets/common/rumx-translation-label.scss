@@ -1,0 +1,35 @@
+// Translated-post indicator (see components/rumx-translation-label.gjs).
+// Lives in the post meta-data row next to the timestamp; core styles the
+// icon-only default as a muted glyph. Make it read as a clickable label.
+.post-info.post-language {
+  .rumx-translation-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3em;
+    color: var(--tertiary);
+    cursor: pointer;
+    white-space: nowrap;
+
+    .d-icon {
+      color: inherit;
+    }
+
+    &__text {
+      font-size: var(--font-down-1);
+      text-decoration: underline dotted;
+      text-underline-offset: 0.15em;
+    }
+
+    &.is-original {
+      color: var(--primary-medium);
+    }
+
+    &.is-outdated {
+      color: var(--primary-medium);
+    }
+  }
+
+  &:hover .rumx-translation-label {
+    color: var(--tertiary-hover);
+  }
+}

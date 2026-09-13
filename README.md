@@ -47,6 +47,14 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
    translation of their own post (core behaviour); one line in
    `ContentLocalizationExtension` would change that.
 
+6. **Visible "translated" label** (v2.3.0). Core marks a translated post with
+   a bare language icon whose tooltip is the only hint; readers did not notice
+   they were reading translations and could not find "original". The
+   `post-language-indicator` outlet is replaced by a label ("Übersetzt aus EN" /
+   "Original (EN)", `config/locales/client.*.yml`); click/tap behaviour stays
+   core's (desktop click toggles, mobile tap opens the tooltip with the
+   "show original" button). Stylesheet `assets/stylesheets/common/`.
+
 The three consumers of the clean RX href shape — the UTM pass (skip), the JS
 rewrite and the click normalizer — key on the same regex. Change one, change
 all three.

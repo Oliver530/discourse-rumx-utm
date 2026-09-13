@@ -1,0 +1,5 @@
+fr:
+  js:
+    rumx_translation:
+      translated_from: "Traduit de %{language}"
+      showing_original: "Original (%{language})"

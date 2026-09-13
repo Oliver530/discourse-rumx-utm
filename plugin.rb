@@ -1,8 +1,10 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh
-# version: 2.2.0
+# version: 2.3.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
+
+register_asset "stylesheets/common/rumx-translation-label.scss"
 
 after_initialize do
   module ::DiscourseRUMXUTM
