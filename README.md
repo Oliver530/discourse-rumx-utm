@@ -38,6 +38,10 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
      the exact SQL predicate finds stale, at most 12 attempts per run, posts
      saved in the last 6 min left to the on-edit job; `post_ids:` narrows a
      run (`Jobs::RumxRefreshStaleLocalizations.new.execute(post_ids: [123])`);
+   - a translation shorter than half its source (sources > 300 chars) is
+     discarded and the original shown — Haiku 4.5 reproducibly truncates at a
+     German closing quote („…"); the digest is kept so nothing retries until
+     the post is edited;
    - re-translations of unchanged text are skipped before quota is spent
      (`has_relocalize_quota?` prepend), each translation runs under a
      per-post/locale `DistributedMutex`, and Discourse AI's
@@ -46,6 +50,14 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
    e-mails, which core reads directly. Authors are not exempt from seeing the
    translation of their own post (core behaviour); one line in
    `ContentLocalizationExtension` would change that.
+
+6. **Visible "translated" label** (v2.3.0). Core marks a translated post with
+   a bare language icon whose tooltip is the only hint; readers did not notice
+   they were reading translations and could not find "original". The
+   `post-language-indicator` outlet is replaced by a label ("Übersetzt aus EN" /
+   "Original (EN)", `config/locales/client.*.yml`); click/tap behaviour stays
+   core's (desktop click toggles, mobile tap opens the tooltip with the
+   "show original" button). Stylesheet `assets/stylesheets/common/`.
 
 The three consumers of the clean RX href shape — the UTM pass (skip), the JS
 rewrite and the click normalizer — key on the same regex. Change one, change

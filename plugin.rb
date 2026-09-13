@@ -1,8 +1,10 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh
-# version: 2.2.0
+# version: 2.3.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
+
+register_asset "stylesheets/common/rumx-translation-label.scss"
 
 after_initialize do
   module ::DiscourseRUMXUTM
@@ -348,6 +350,18 @@ after_initialize do
     module PostLocalizerExtension
       LOCK_VALIDITY_SECONDS = 120 # an LLM call takes ~5-10 s; the lock must outlive a slow one
 
+      # A translation shorter than half its source (for sources longer than
+      # 300 chars) is discarded: Claude Haiku 4.5 reproducibly closes the
+      # structured-output JSON at a German closing quote („…") and stops —
+      # post 298979 came back at 17% of its length on five attempts. The
+      # reader gets the original instead of a fragment. The digest is still
+      # recorded, so nothing retries the same text (on-edit dedupe, backfill
+      # skip, reconciler sees no row); the next real edit translates again.
+      # Calibrated on 114 long translations: p5 of the length ratio was 0.9,
+      # median 1.06, the truncated one 0.17.
+      MIN_SOURCE_LENGTH_FOR_GUARD = 300
+      MIN_LENGTH_RATIO = 0.5
+
       def localize(post, target_locale = I18n.locale, llm_model: nil)
         return super if post.blank?
         locale = target_locale.to_s.sub("-", "_")
@@ -357,11 +371,28 @@ after_initialize do
           validity: LOCK_VALIDITY_SECONDS,
         ) do
           post.reload
-          source_digest = TranslationFreshness.digest(post.raw)
+          source_raw = post.raw.to_s
+          source_digest = TranslationFreshness.digest(source_raw)
           localization = super(post, target_locale, llm_model: llm_model)
-          TranslationFreshness.record!(post, localization.locale, source_digest) if localization
+          next nil if localization.nil?
+
+          TranslationFreshness.record!(post, localization.locale, source_digest)
+          if implausibly_short?(source_raw, localization.raw)
+            Rails.logger.warn(
+              "discourse-rumx-utm: translation of post #{post.id} to #{localization.locale} is " \
+                "#{localization.raw.to_s.length}/#{source_raw.length} chars of the source — discarded, " \
+                "readers see the original until the post is edited",
+            )
+            localization.destroy!
+            next nil
+          end
           localization
         end
+      end
+
+      def implausibly_short?(source_raw, translated_raw)
+        return false if source_raw.length <= MIN_SOURCE_LENGTH_FOR_GUARD
+        translated_raw.to_s.length < MIN_LENGTH_RATIO * source_raw.length
       end
 
       def has_relocalize_quota?(model, locale, skip_incr: false)
@@ -451,6 +482,8 @@ after_initialize do
           AND (:include_bots OR p.user_id > 0)
           AND (:include_pms OR t.archetype <> 'private_message')
           AND (:post_ids_filter OR p.id IN (:post_ids))
+          AND split_part(replace(pl.locale, '-', '_'), '_', 1)
+              <> split_part(replace(coalesce(p.locale, ''), '-', '_'), '_', 1)
           AND (
             CASE
               WHEN (SELECT value FROM post_custom_fields

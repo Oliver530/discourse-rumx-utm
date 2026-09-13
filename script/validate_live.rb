@@ -79,7 +79,9 @@ check.("localized handler linkifies", ldoc.css("a").map { |a| a["href"] } == ["h
 
 # ---------- 4. TopicLinkClick prepend ----------
 check.("TopicLinkClick prepended", ::TopicLinkClick.singleton_class.ancestors.include?(::DiscourseRUMXUTM::TopicLinkClickExtension))
-tl = TopicLink.where("url ~ ?", '^https://rumx\.com/en/rums/[0-9]+/$').where.not(post_id: nil).order(id: :desc).first
+# public topic only: TopicLinkClick.create_from refuses clicks the (anonymous) guardian cannot see
+tl = TopicLink.joins(topic: :category).where("url ~ ?", '^https://rumx\.com/en/rums/[0-9]+/$').where.not(post_id: nil)
+  .where(topics: { archetype: "regular", deleted_at: nil, visible: true }).where(categories: { read_restricted: false }).order(id: :desc).first
 rx_id = tl.url[%r{/rums/(\d+)/}, 1]
 post = tl.post
 puts "  using topic_link #{tl.id} post #{tl.post_id} topic #{tl.topic_id} url #{tl.url} (author user #{post.user_id})"
@@ -125,8 +127,24 @@ sample_raw = "Für mich war der RX7295 „etwas“ besser 🥃\n\n* 5cl: 19€"
 check.("Ruby MD5 == Postgres md5() (SQL predicate parity, incl. UTF-8)", DB.query_single("SELECT md5(?)", sample_raw).first == tf.digest(sample_raw))
 
 core_show = ::ContentLocalization.method(:show_translated_post?).super_method
-stale_loc = PostLocalization.joins(:post).where("post_localizations.post_version < posts.version").where(locale: "de").where("posts.deleted_at IS NULL").order("posts.updated_at desc").first
 fresh_loc = PostLocalization.joins(:post).where("post_localizations.post_version = posts.version").where(locale: "de").where("posts.deleted_at IS NULL AND posts.locale = 'en' AND posts.user_id > 0").order("posts.updated_at desc").first
+# A real stale legacy row (translation behind the post, no digest, language differs from the post)
+# may not exist once the reconciler has done its work; then synthesize one inside the transaction below.
+stale_loc = PostLocalization.joins(:post).where("post_localizations.post_version < posts.version").where(locale: "de")
+  .where("posts.deleted_at IS NULL AND posts.locale <> 'de' AND posts.user_id > 0")
+  .where("NOT EXISTS (SELECT 1 FROM post_custom_fields f WHERE f.post_id = posts.id AND f.name = ?)", ::DiscourseRUMXUTM::TranslationFreshness.field_name("de"))
+  .order("posts.updated_at desc").first
+stale_synthetic = false
+if stale_loc.nil? && fresh_loc
+  # take another fresh EN post with a de localization and pretend the post moved on (rolled back at the end)
+  cand = PostLocalization.joins(:post).where("post_localizations.post_version = posts.version").where(locale: "de").where("posts.deleted_at IS NULL AND posts.locale = 'en' AND posts.user_id > 0").where.not(post_id: fresh_loc.post_id).order("posts.updated_at desc").first
+  if cand
+    ActiveRecord::Base.connection.begin_transaction(joinable: false)
+    PostCustomField.where(post_id: cand.post_id, name: ::DiscourseRUMXUTM::TranslationFreshness.field_name("de")).delete_all
+    cand.update_columns(post_version: cand.post_version - 1)
+    stale_loc = PostLocalization.find(cand.id); stale_synthetic = true
+  end
+end
 de_reader = User.joins(:user_option).where(locale: "de", active: true, admin: false)
   .where(user_options: { automatically_translate: true })
   .where("user_options.understood_languages IS NULL OR cardinality(user_options.understood_languages) = 0")
@@ -134,7 +152,7 @@ de_reader = User.joins(:user_option).where(locale: "de", active: true, admin: fa
 job = ::Jobs::RumxRefreshStaleLocalizations
 if stale_loc && fresh_loc && de_reader
   sp, fp = stale_loc.post, fresh_loc.post
-  puts "  stale (legacy, no digest): post #{sp.id} v#{sp.version} de@v#{stale_loc.post_version} (#{sp.user.username}); fresh: post #{fp.id} v#{fp.version} de@v#{fresh_loc.post_version} (#{fp.user.username}); DE reader: #{de_reader.username}"
+  puts "  stale (legacy, no digest#{stale_synthetic ? ', SYNTHESIZED in a transaction' : ''}): post #{sp.id} v#{sp.version} de@v#{stale_loc.post_version} (#{sp.user.username}); fresh: post #{fp.id} v#{fp.version} de@v#{fresh_loc.post_version} (#{fp.user.username}); DE reader: #{de_reader.username}"
   I18n.with_locale(:de) do
     reader = Guardian.new(de_reader)
     check.("core would show the STALE translation (proves the gap)", core_show.call(sp, reader) == true)
@@ -153,12 +171,15 @@ if stale_loc && fresh_loc && de_reader
   # ---- real jobs with a STUBBED translator (no LLM calls), inside a rolled-back transaction ----
   ::DiscourseAi::Translation::PostRawTranslator.class_eval do
     def translate
+      return "[stub short]" if $rumx_stub_short
       "[stub #{@target_locale}] #{@text}"
     end
   end
   audit_before = AiApiAuditLog.count
   fp_id = fp.id
-  redis_keys = %w[de fr].flat_map { |l| ["post_relocalized_#{fp_id}_#{l}", tf.lock_key(fp, l)] }
+  digest_rows_before = PostCustomField.where(post_id: fp_id).where("name LIKE 'rumx_localized_src_md5_%'").count
+  loc_rows_before = PostLocalization.where(post_id: fp_id).count
+  redis_keys = %w[de fr en].flat_map { |l| ["post_relocalized_#{fp_id}_#{l}", tf.lock_key(fp, l)] }
   redis_keys.each { |k| Discourse.redis.del(k) }
   I18n.with_locale(:de) do
     reader = Guardian.new(de_reader)
@@ -170,7 +191,9 @@ if stale_loc && fresh_loc && de_reader
       check.("T0 localize(): translation written from the stub and digest == md5(raw)", loc.raw.start_with?("[stub de]") && tf.digest_state(post, "de") == true && tf.fresh?(post, loc))
       check.("T0 lock released after localize()", Discourse.redis.get(tf.lock_key(post, "de")).nil?)
       check.("T0 digest recorded as ONE custom field row", PostCustomField.where(post_id: post.id, name: tf.field_name("de")).count == 1)
-      # T1: the REAL on-edit job — de is fresh (digest) -> skipped without quota; fr has no digest -> translated
+      # T1: the REAL on-edit job — de is fresh (digest) -> skipped without quota; fr without digest -> translated
+      PostCustomField.where(post_id: post.id, name: tf.field_name("fr")).delete_all
+      post = Post.find(fp_id)
       ::Jobs::DetectTranslatePost.new.execute(post_id: post.id)
       post = Post.find(fp_id)
       fr = post.localizations.find_by(locale: "fr")
@@ -201,18 +224,40 @@ if stale_loc && fresh_loc && de_reader
       Post.preload_custom_fields([post], ["some_other_plugin_field"])
       state = begin; tf.digest_state(post, "de"); rescue => e; "RAISED #{e.class}"; end
       check.("T5 preloaded proxy without our field -> nil (version fallback), no NotPreloadedError", state.nil?)
+      # T6: implausibly short translation is discarded, digest kept, nothing retries
+      post = Post.find(fp_id)
+      long_raw = post.raw + ("\nLorem ipsum dolor sit amet, consectetur adipiscing elit. " * 8)
+      post.update_columns(raw: long_raw)
+      post = Post.find(fp_id)
+      $rumx_stub_short = true
+      r6 = ::DiscourseAi::Translation::PostLocalizer.localize(post, "fr")
+      $rumx_stub_short = false
+      check.("T6 short translation (< 50% of a > 300-char source) -> discarded, localize returns nil", r6.nil? && post.localizations.reload.find_by(locale: "fr").nil?)
+      check.("T6 digest still recorded -> dedupe blocks retries, SQL predicate finds nothing for fr", tf.digest_state(post, "fr") == true && ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(post, "fr") == false && job.stale_localization_ids(limit: 100, post_ids: [fp_id]).none? { |id| PostLocalization.find(id).locale == "fr" })
+      $rumx_stub_short = false
+      r6b = ::DiscourseAi::Translation::PostLocalizer.localize(post, "fr")
+      check.("T6 normal-length translation of the same source is accepted", r6b && r6b.raw.start_with?("[stub fr]") && tf.fresh?(post, r6b))
+      # T7: a localization in the post's own language is never a reconciler candidate
+      own = PostLocalization.create!(post_id: post.id, locale: post.locale, raw: "x", cooked: "<p>x</p>", post_version: 0, localizer_user_id: -1)
+      check.("T7 same-locale localization (version behind) excluded from the stale query", !job.stale_localization_ids(limit: 100, post_ids: [fp_id]).include?(own.id))
       raise ActiveRecord::Rollback
     end
   end
   redis_keys.each { |k| Discourse.redis.del(k) }
   check.("no LLM calls were made by the stubbed runs", AiApiAuditLog.count == audit_before, "before=#{audit_before} after=#{AiApiAuditLog.count}")
-  check.("transaction rolled back (fixture post unchanged)", Post.find(fp_id).raw == fp.raw && PostCustomField.where(post_id: fp_id, name: tf.field_name("de")).count == 0)
+  check.("transaction rolled back (fixture post, digest rows, localizations unchanged)", Post.find(fp_id).raw == fp.raw && PostCustomField.where(post_id: fp_id).where("name LIKE 'rumx_localized_src_md5_%'").count == digest_rows_before && PostLocalization.where(post_id: fp_id).count == loc_rows_before)
+  if stale_synthetic
+    ActiveRecord::Base.connection.rollback_transaction
+    check.("synthetic stale fixture rolled back", PostLocalization.find(stale_loc.id).post_version == stale_loc.post.version)
+  end
 
   # ---- exactness / no starvation: SQL result == Ruby scan (eligible, quiet) ----
   sql_ids = job.stale_localization_ids(limit: 100_000)
   ruby_ids = PostLocalization.joins(post: :topic).where("posts.deleted_at IS NULL AND topics.deleted_at IS NULL AND posts.raw <> '' AND posts.user_id > 0 AND topics.archetype <> 'private_message'")
-    .where("posts.updated_at < ?", job::QUIET_PERIOD.ago).includes(:post).reject { |l| tf.fresh?(l.post, l) }.map(&:id)
-  check.("SQL staleness predicate == Ruby fresh?() over all localizations (exact, no starvation)", sql_ids.sort == ruby_ids.sort, "sql=#{sql_ids.size} ruby=#{ruby_ids.size} known_stale_included=#{sql_ids.include?(stale_loc.id)}")
+    .where("posts.updated_at < ?", job::QUIET_PERIOD.ago).includes(:post)
+    .reject { |l| l.locale.to_s.split("_").first == l.post.locale.to_s.split("_").first } # same-language rows: PostLocalizer returns nil, never a candidate
+    .reject { |l| tf.fresh?(l.post, l) }.map(&:id)
+  check.("SQL staleness predicate == Ruby fresh?() over all localizations (exact, no starvation)", sql_ids.sort == ruby_ids.sort, "sql=#{sql_ids.size} ruby=#{ruby_ids.size}")
 else
   check.("fixtures for translation checks found (stale de, fresh de, DE reader)", false, "stale=#{stale_loc&.id.inspect} fresh=#{fresh_loc&.id.inspect} reader=#{de_reader&.id.inspect}")
 end
