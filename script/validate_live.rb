@@ -23,6 +23,7 @@ body = src[/after_initialize do\n(.*)\nend\s*\z/m, 1] or raise "could not extrac
 handlers = {}
 ctx = Object.new
 ctx.define_singleton_method(:on) { |evt, &blk| handlers[evt] = blk }
+ctx.define_singleton_method(:register_post_custom_field_type) { |name, type, **opts| ::Post.register_custom_field_type(name, type, **opts) }
 ctx.instance_eval(body, plugin_path, 8)
 
 fails = 0
@@ -110,6 +111,129 @@ begin
   check.("non-matching urls pass through without raising", true)
 rescue => e
   check.("non-matching / malformed urls pass through without raising", false, "#{e.class}: #{e.message}")
+end
+
+# ---------- 5. Translation freshness: digest-based show_translated_post? ----------
+puts
+puts "-- translation freshness --"
+tf = ::DiscourseRUMXUTM::TranslationFreshness
+check.("ContentLocalization prepended", ::ContentLocalization.singleton_class.ancestors.include?(::DiscourseRUMXUTM::ContentLocalizationExtension))
+check.("PostLocalizer prepended (lock + digest recording + dedupe)", ::DiscourseAi::Translation::PostLocalizer.singleton_class.ancestors.include?(::DiscourseRUMXUTM::PostLocalizerExtension))
+check.("digest custom fields registered for supported locales", tf.supported_locales.all? { |l| ::Post.get_custom_field_descriptor(tf.field_name(l)).type == :string }, tf.supported_locales.inspect)
+check.("TopicView preloads the digest fields", (::TopicView.allowed_post_custom_fields(nil, nil) & tf.supported_locales.map { |l| tf.field_name(l) }).size == tf.supported_locales.size)
+sample_raw = "Für mich war der RX7295 „etwas“ besser 🥃\n\n* 5cl: 19€"
+check.("Ruby MD5 == Postgres md5() (SQL predicate parity, incl. UTF-8)", DB.query_single("SELECT md5(?)", sample_raw).first == tf.digest(sample_raw))
+
+core_show = ::ContentLocalization.method(:show_translated_post?).super_method
+stale_loc = PostLocalization.joins(:post).where("post_localizations.post_version < posts.version").where(locale: "de").where("posts.deleted_at IS NULL").order("posts.updated_at desc").first
+fresh_loc = PostLocalization.joins(:post).where("post_localizations.post_version = posts.version").where(locale: "de").where("posts.deleted_at IS NULL AND posts.locale = 'en' AND posts.user_id > 0").order("posts.updated_at desc").first
+de_reader = User.joins(:user_option).where(locale: "de", active: true, admin: false)
+  .where(user_options: { automatically_translate: true })
+  .where("user_options.understood_languages IS NULL OR cardinality(user_options.understood_languages) = 0")
+  .where.not(id: [stale_loc&.post&.user_id, fresh_loc&.post&.user_id].compact).order(last_seen_at: :desc).first
+job = ::Jobs::RumxRefreshStaleLocalizations
+if stale_loc && fresh_loc && de_reader
+  sp, fp = stale_loc.post, fresh_loc.post
+  puts "  stale (legacy, no digest): post #{sp.id} v#{sp.version} de@v#{stale_loc.post_version} (#{sp.user.username}); fresh: post #{fp.id} v#{fp.version} de@v#{fresh_loc.post_version} (#{fp.user.username}); DE reader: #{de_reader.username}"
+  I18n.with_locale(:de) do
+    reader = Guardian.new(de_reader)
+    check.("core would show the STALE translation (proves the gap)", core_show.call(sp, reader) == true)
+    check.("legacy stale (version behind): NOT shown", ::ContentLocalization.show_translated_post?(sp, reader) == false)
+    json = PostSerializer.new(sp, scope: reader, root: false).as_json
+    check.("serializer serves the ORIGINAL cooked for stale, is_localized=false", json[:cooked] == sp.cooked && json[:cooked] != stale_loc.cooked && json[:is_localized] == false)
+    check.("legacy fresh (version equal, no digest): shown", ::ContentLocalization.show_translated_post?(fp, reader) == true)
+    check.("serializer serves the TRANSLATION for fresh", PostSerializer.new(fp, scope: reader, root: false).as_json[:cooked] == fresh_loc.cooked)
+    check.("author sees the translation too (no author exemption — core behaviour kept)", ::ContentLocalization.show_translated_post?(fp, Guardian.new(fp.user)) == true)
+    check.("anonymous DE reader: stale hidden, fresh shown", ::ContentLocalization.show_translated_post?(sp, Guardian.new) == false && ::ContentLocalization.show_translated_post?(fp, Guardian.new) == true)
+  end
+  I18n.with_locale(:en) do
+    check.("EN reader of an EN post: unchanged (no translation, in_user_locale)", ::ContentLocalization.show_translated_post?(fp, Guardian.new(de_reader)) == false)
+  end
+
+  # ---- real jobs with a STUBBED translator (no LLM calls), inside a rolled-back transaction ----
+  ::DiscourseAi::Translation::PostRawTranslator.class_eval do
+    def translate
+      "[stub #{@target_locale}] #{@text}"
+    end
+  end
+  audit_before = AiApiAuditLog.count
+  fp_id = fp.id
+  redis_keys = %w[de fr].flat_map { |l| ["post_relocalized_#{fp_id}_#{l}", tf.lock_key(fp, l)] }
+  redis_keys.each { |k| Discourse.redis.del(k) }
+  I18n.with_locale(:de) do
+    reader = Guardian.new(de_reader)
+    ActiveRecord::Base.transaction do
+      post = Post.find(fp_id)
+      # T0: a real localize() run records translation + digest under the lock
+      loc = ::DiscourseAi::Translation::PostLocalizer.localize(post, "de")
+      loc_updated_t0 = loc.reload.updated_at
+      check.("T0 localize(): translation written from the stub and digest == md5(raw)", loc.raw.start_with?("[stub de]") && tf.digest_state(post, "de") == true && tf.fresh?(post, loc))
+      check.("T0 lock released after localize()", Discourse.redis.get(tf.lock_key(post, "de")).nil?)
+      check.("T0 digest recorded as ONE custom field row", PostCustomField.where(post_id: post.id, name: tf.field_name("de")).count == 1)
+      # T1: the REAL on-edit job — de is fresh (digest) -> skipped without quota; fr has no digest -> translated
+      ::Jobs::DetectTranslatePost.new.execute(post_id: post.id)
+      post = Post.find(fp_id)
+      fr = post.localizations.find_by(locale: "fr")
+      check.("T1 DetectTranslatePost: fresh de localization NOT re-translated (dedupe), no quota spent", loc.reload.updated_at == loc_updated_t0 && Discourse.redis.get("post_relocalized_#{fp_id}_de").nil?)
+      check.("T1 DetectTranslatePost: fr (no digest) translated through core path and digest recorded", fr && fr.raw.start_with?("[stub fr]") && tf.digest_state(post, "fr") == true)
+      # T2: GRACE-PERIOD EDIT — raw changes, version does not
+      v = post.version
+      post.update_columns(raw: post.raw + "\n* 5cl: Rumurmel")
+      post = Post.find(fp_id)
+      check.("T2 same version, changed raw -> both translations stale and hidden", post.version == v && tf.fresh?(post, post.localizations.find_by(locale: "de")) == false && ::ContentLocalization.show_translated_post?(post, reader) == false)
+      check.("T2 serializer serves the ORIGINAL for the grace-edited post", PostSerializer.new(post, scope: reader, root: false).as_json[:cooked] == post.cooked)
+      # T3: the REAL reconciler — exact SQL predicate finds them, refreshes, digests match again
+      post.update_columns(updated_at: 10.minutes.ago)
+      ids = job.stale_localization_ids(limit: 100, post_ids: [fp_id])
+      check.("T3 SQL predicate finds exactly the 2 stale localizations of the post", ids.sort == post.localizations.pluck(:id).sort, ids.inspect)
+      result = job.new.execute(post_ids: [fp_id])
+      post = Post.find(fp_id)
+      check.("T3 reconciler re-translated both (2 attempts, 2 refreshed)", result[:attempts] == 2 && result[:refreshed].size == 2, result.inspect)
+      check.("T3 after reconcile: translations carry the new text, fresh, shown again", post.localizations.all? { |l| l.raw.include?("Rumurmel") && tf.fresh?(post, l) } && ::ContentLocalization.show_translated_post?(post, reader) == true)
+      check.("T3 SQL predicate now finds nothing for the post", job.stale_localization_ids(limit: 100, post_ids: [fp_id]).empty?)
+      # T4: duplicate custom-field rows (a past race) are tolerated and cleaned
+      PostCustomField.create!(post_id: post.id, name: tf.field_name("de"), value: "garbage")
+      post = Post.find(fp_id)
+      check.("T4 duplicate digest row: oldest wins, still fresh", tf.digest_state(post, "de") == true)
+      tf.record!(post, "de", tf.digest(post.raw))
+      check.("T4 record! removes the duplicate", PostCustomField.where(post_id: post.id, name: tf.field_name("de")).count == 1)
+      # T5: preload safety — a proxy without our field must not raise
+      Post.preload_custom_fields([post], ["some_other_plugin_field"])
+      state = begin; tf.digest_state(post, "de"); rescue => e; "RAISED #{e.class}"; end
+      check.("T5 preloaded proxy without our field -> nil (version fallback), no NotPreloadedError", state.nil?)
+      raise ActiveRecord::Rollback
+    end
+  end
+  redis_keys.each { |k| Discourse.redis.del(k) }
+  check.("no LLM calls were made by the stubbed runs", AiApiAuditLog.count == audit_before, "before=#{audit_before} after=#{AiApiAuditLog.count}")
+  check.("transaction rolled back (fixture post unchanged)", Post.find(fp_id).raw == fp.raw && PostCustomField.where(post_id: fp_id, name: tf.field_name("de")).count == 0)
+
+  # ---- exactness / no starvation: SQL result == Ruby scan (eligible, quiet) ----
+  sql_ids = job.stale_localization_ids(limit: 100_000)
+  ruby_ids = PostLocalization.joins(post: :topic).where("posts.deleted_at IS NULL AND topics.deleted_at IS NULL AND posts.raw <> '' AND posts.user_id > 0 AND topics.archetype <> 'private_message'")
+    .where("posts.updated_at < ?", job::QUIET_PERIOD.ago).includes(:post).reject { |l| tf.fresh?(l.post, l) }.map(&:id)
+  check.("SQL staleness predicate == Ruby fresh?() over all localizations (exact, no starvation)", sql_ids.sort == ruby_ids.sort, "sql=#{sql_ids.size} ruby=#{ruby_ids.size} known_stale_included=#{sql_ids.include?(stale_loc.id)}")
+else
+  check.("fixtures for translation checks found (stale de, fresh de, DE reader)", false, "stale=#{stale_loc&.id.inspect} fresh=#{fresh_loc&.id.inspect} reader=#{de_reader&.id.inspect}")
+end
+
+# ---------- 6. Discourse AI re-translation quota ----------
+puts
+puts "-- re-translation quota --"
+if defined?(::DiscourseAi::Translation::LocalizableQuota)
+  q = ::DiscourseAi::Translation::LocalizableQuota::MAX_QUOTA_PER_DAY
+  check.("MAX_QUOTA_PER_DAY raised to 20", q == 20, q.inspect)
+  probe = Post.order(id: :desc).first
+  key = ::DiscourseAi::Translation::PostLocalizer.relocalize_key(probe, "zz")
+  Discourse.redis.del(key)
+  check.("quota: fresh key -> allowed (no increment)", ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(probe, "zz", skip_incr: true) == true)
+  Discourse.redis.set(key, 19, ex: 60)
+  check.("quota: 19 used -> still allowed", ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(probe, "zz", skip_incr: true) == true)
+  Discourse.redis.set(key, 20, ex: 60)
+  check.("quota: 20 used -> blocked", ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(probe, "zz", skip_incr: true) == false)
+  Discourse.redis.del(key)
+else
+  puts "  (discourse-ai not loaded — quota override skipped)"
 end
 
 puts

@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
-# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links
-# version: 2.1.0
+# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh
+# version: 2.2.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -213,9 +213,339 @@ after_initialize do
         super(args.merge(url: "https://rumx.com/en/rums/#{match[1]}/"))
       end
     end
+
+    # ---- Translation freshness (content localization + Discourse AI) ----
+    #
+    # Core shows a reader the stored translation of a post whenever one exists
+    # for their locale, with NO check that it still matches the post: after an
+    # edit, ContentLocalization.translated_post_cooked keeps serving the old
+    # localization and only flips a tooltip ("translation may be outdated").
+    # Discourse AI re-translates at most MAX_QUOTA_PER_DAY times per post and
+    # locale, and its backfill only fills MISSING locales, never stale ones. On
+    # bottle-split posts (participant lists edited 5-15x a day) that meant DE/FR
+    # readers — including the organiser reading the forum in German — saw a
+    # participant list several versions old for the rest of the day
+    # (2026-09-13: 29 stale localizations on 14 posts, nearly all splits).
+    #
+    # Freshness is decided by the SOURCE TEXT that was translated, not by
+    # post.version: PostRevisor folds small edits by the same author within
+    # editing_grace_period (5 min, <= 100 chars diff) into the previous revision
+    # without bumping version — exactly the "add one participant" edit. Every AI
+    # translation therefore records an MD5 of the raw it translated, per
+    # (post, locale), in a post custom field; a translation is fresh only while
+    # that digest equals the current raw. MD5 rather than SHA1 so the
+    # reconciler can evaluate the same predicate in SQL (Postgres md5()).
+    # Translations made before this version carry no digest and fall back to
+    # the version comparison until they are re-translated once.
+    #
+    # Three parts: (1) hide a stale translation and serve the original,
+    # (2) record the digest under a per-post/locale lock and skip pointless
+    # re-translations, (3) a scheduled job that re-translates whatever the
+    # exact SQL predicate finds stale, regardless of Discourse AI's daily
+    # quota, so "original until the fresh translation lands" is bounded even
+    # when the author never edits again or an LLM call failed (retry: false in
+    # core). Bound: QUIET_PERIOD + up to one 15-min schedule + LLM time, plus
+    # backlog at MAX_PER_RUN per run — typically ~10-20 min, not seconds.
+    module TranslationFreshness
+      FIELD_PREFIX = "rumx_localized_src_md5_"
+
+      def self.supported_locales
+        SiteSetting.content_localization_supported_locales.to_s.split("|").map(&:strip).reject(&:blank?)
+      end
+
+      def self.field_name(locale)
+        "#{FIELD_PREFIX}#{locale.to_s.sub("-", "_")}"
+      end
+
+      def self.digest(raw)
+        Digest::MD5.hexdigest(raw.to_s)
+      end
+
+      def self.lock_key(post, locale)
+        "rumx_localize_#{post.id}_#{locale}"
+      end
+
+      # Preload-safe: TopicView hands posts a PreloadedProxy that RAISES for
+      # any key outside the allowlist (an admin-made localization in a locale
+      # that is not a configured one, say). Unknown means "no digest" — the
+      # version comparison then decides. Duplicate rows (a past race) come
+      # back as an Array; record! keeps the oldest row, so mirror that here.
+      def self.stored_digest(post, locale)
+        name = field_name(locale)
+        return nil if post.custom_fields_preloaded? && !post.custom_field_preloaded?(name)
+        value = post.custom_fields[name]
+        value = value.first if value.is_a?(Array)
+        value.presence
+      rescue ::HasCustomFields::NotPreloadedError
+        nil
+      end
+
+      # true = digest matches the current raw, false = differs, nil = no digest
+      def self.digest_state(post, locale)
+        stored = stored_digest(post, locale)
+        return nil if stored.nil?
+        stored == digest(post.raw)
+      end
+
+      def self.fresh?(post, localization)
+        state = digest_state(post, localization.locale)
+        return localization.post_version == post.version if state.nil?
+        state
+      end
+
+      # One row per (post, locale), written directly. NOT post.save_custom_fields:
+      # that writes the whole in-memory hash back and DELETES fields it does not
+      # know about, so two processes translating de and fr of the same post at
+      # the same moment could wipe each other's digest. Extra rows from any
+      # past race are removed here, otherwise core reads them as an Array and
+      # the digest would compare unequal forever. Only the process-local cache
+      # is cleared (never the TopicView preload proxy).
+      def self.record!(post, locale, digest_value)
+        name = field_name(locale)
+        rows = ::PostCustomField.where(post_id: post.id, name: name).order(:id).to_a
+        keep = rows.shift || ::PostCustomField.new(post_id: post.id, name: name)
+        rows.each(&:destroy!)
+        keep.value = digest_value
+        keep.save!
+        post.clear_custom_fields unless post.custom_fields_preloaded?
+      end
+    end
+
+    # (1) Serve the original instead of a stale translation. Every consumer
+    # (cooked, excerpt, is_localized flag, localized oneboxes) goes through
+    # this predicate, so the UI stays consistent: an unshown translation also
+    # shows no language icon. Not covered on purpose: topic-list excerpts and
+    # e-mails read the topic localization / post directly in core.
+    module ContentLocalizationExtension
+      def show_translated_post?(post, scope)
+        return false unless super
+
+        localization = post.get_localization
+        return false if localization && !TranslationFreshness.fresh?(post, localization)
+
+        true
+      end
+    end
+
+    # (2) Discourse AI's PostLocalizer.
+    #
+    # localize: one writer per (post, locale) at a time (DistributedMutex —
+    # core's on-edit job and the reconciler below are different job classes,
+    # cluster_concurrency does not serialize them against each other), the
+    # post re-read inside the lock so the LLM gets what is in the DB now and
+    # not what the caller loaded minutes ago, the digest computed BEFORE super
+    # from that same string, and translation + digest written back to back.
+    # No "already fresh, skip" short-circuit here: a forced manual
+    # re-translation of a bad (e.g. truncated) translation must still run.
+    #
+    # has_relocalize_quota?: a localization whose digest already matches the
+    # current raw needs no quota — returning false makes Jobs::DetectTranslatePost
+    # skip it (`next if !force && exists && !has_quota`) without spending an
+    # increment. N saves inside the grace period enqueue N re-translation jobs
+    # five minutes later; only the first meets changed text. `force` and the
+    # missing-localization branch are untouched, as in core. Overloaded
+    # contract, kept deliberately narrow (Post instances, present locale).
+    module PostLocalizerExtension
+      LOCK_VALIDITY_SECONDS = 120 # an LLM call takes ~5-10 s; the lock must outlive a slow one
+
+      def localize(post, target_locale = I18n.locale, llm_model: nil)
+        return super if post.blank?
+        locale = target_locale.to_s.sub("-", "_")
+
+        ::DistributedMutex.synchronize(
+          TranslationFreshness.lock_key(post, locale),
+          validity: LOCK_VALIDITY_SECONDS,
+        ) do
+          post.reload
+          source_digest = TranslationFreshness.digest(post.raw)
+          localization = super(post, target_locale, llm_model: llm_model)
+          TranslationFreshness.record!(post, localization.locale, source_digest) if localization
+          localization
+        end
+      end
+
+      def has_relocalize_quota?(model, locale, skip_incr: false)
+        if model.is_a?(::Post) && locale.present? &&
+             TranslationFreshness.digest_state(model, locale) == true
+          return false
+        end
+        super
+      end
+    end
   end
 
   ::TopicLinkClick.singleton_class.prepend(::DiscourseRUMXUTM::TopicLinkClickExtension)
+  ::ContentLocalization.singleton_class.prepend(::DiscourseRUMXUTM::ContentLocalizationExtension)
+
+  # Digest fields: typed so values round-trip as strings, allowlisted so
+  # TopicView preloads them with the posts (no per-post query in the hot
+  # predicate above). The allowlist block re-reads the setting per request;
+  # the type registration happens once at boot (an unregistered name would
+  # default to :string anyway).
+  ::DiscourseRUMXUTM::TranslationFreshness.supported_locales.each do |locale|
+    register_post_custom_field_type(::DiscourseRUMXUTM::TranslationFreshness.field_name(locale), :string)
+  end
+  ::TopicView.add_post_custom_fields_allowlister do |_user, _topic|
+    ::DiscourseRUMXUTM::TranslationFreshness.supported_locales.map do |locale|
+      ::DiscourseRUMXUTM::TranslationFreshness.field_name(locale)
+    end
+  end
+
+  if defined?(::DiscourseAi::Translation::PostLocalizer)
+    ::DiscourseAi::Translation::PostLocalizer.singleton_class.prepend(
+      ::DiscourseRUMXUTM::PostLocalizerExtension,
+    )
+
+    # Discourse AI caps re-translations at MAX_QUOTA_PER_DAY = 2 per post and
+    # locale (lib/translation/localizable_quota.rb) — a constant, not a site
+    # setting. The digest dedupe above keeps on-edit re-translations bounded by
+    # real text changes, so 20 is a ceiling for a busy split day, not a budget:
+    # a re-translation of a ~1,000-char post costs about 0.6 cent on Haiku 4.5.
+    # The constant is read at call time inside has_relocalize_quota?, so
+    # replacing it here (plugins load alphabetically, discourse-ai before
+    # discourse-rumx-utm) is enough. It applies to topics/categories through
+    # the same concern; those are re-localized rarely (title edits).
+    quota = ::DiscourseAi::Translation::LocalizableQuota
+    if quota.const_defined?(:MAX_QUOTA_PER_DAY, false)
+      quota.send(:remove_const, :MAX_QUOTA_PER_DAY)
+      quota.const_set(:MAX_QUOTA_PER_DAY, 20)
+    else
+      Rails.logger.warn(
+        "discourse-rumx-utm: DiscourseAi::Translation::LocalizableQuota::MAX_QUOTA_PER_DAY " \
+          "not found — re-translation quota left at the discourse-ai default",
+      )
+    end
+
+    # (3) Reconcile stale localizations. Core has no path that refreshes an
+    # existing translation except the on-edit job (quota-limited, retry:
+    # false), so without this a reader could see the original indefinitely
+    # once rule (1) hides a stale translation. The candidate query is the
+    # EXACT staleness predicate in SQL (digest <> md5(raw), or version behind
+    # for legacy rows without a digest) — no timestamp pre-filter, which would
+    # miss a translation that finished after a same-version edit — ordered by
+    # translation age so every stale row is reached (no starvation). Posts
+    # saved in the last QUIET_PERIOD are left to the on-edit job (+5 min).
+    # Eligibility follows Discourse AI's own rules per row (category scope,
+    # personal messages, bot content, configured target locales) but without
+    # its backfill date cutoff: any post that has a translation gets to keep it
+    # fresh. MAX_PER_RUN counts ATTEMPTS, credits are checked before each one,
+    # and open readers are told via the same MessageBus event core publishes.
+    # `post_ids:` narrows a run (ops: refresh these now; also used by tests).
+    class ::Jobs::RumxRefreshStaleLocalizations < ::Jobs::Scheduled
+      every 15.minutes
+      sidekiq_options retry: false
+      cluster_concurrency 1
+
+      MAX_PER_RUN = 12
+      QUIET_PERIOD = 6.minutes
+
+      STALE_SQL = <<~SQL
+        SELECT pl.id
+        FROM post_localizations pl
+        JOIN posts p ON p.id = pl.post_id
+        JOIN topics t ON t.id = p.topic_id
+        WHERE p.deleted_at IS NULL
+          AND t.deleted_at IS NULL
+          AND p.raw IS NOT NULL AND p.raw <> ''
+          AND p.updated_at < :quiet_before
+          AND (:include_bots OR p.user_id > 0)
+          AND (:include_pms OR t.archetype <> 'private_message')
+          AND (:post_ids_filter OR p.id IN (:post_ids))
+          AND (
+            CASE
+              WHEN (SELECT value FROM post_custom_fields
+                    WHERE post_id = p.id AND name = :field_prefix || replace(pl.locale, '-', '_')
+                    ORDER BY id LIMIT 1) IS NULL
+              THEN pl.post_version <> p.version
+              ELSE (SELECT value FROM post_custom_fields
+                    WHERE post_id = p.id AND name = :field_prefix || replace(pl.locale, '-', '_')
+                    ORDER BY id LIMIT 1) <> md5(p.raw)
+            END
+          )
+        ORDER BY pl.updated_at ASC, pl.id ASC
+        LIMIT :limit
+      SQL
+
+      def self.stale_localization_ids(limit:, post_ids: nil)
+        DB.query_single(
+          STALE_SQL,
+          quiet_before: QUIET_PERIOD.ago,
+          include_bots: SiteSetting.ai_translation_include_bot_content,
+          include_pms: SiteSetting.ai_translation_personal_messages != "none",
+          post_ids_filter: post_ids.blank?,
+          post_ids: Array(post_ids).presence || [-1],
+          field_prefix: ::DiscourseRUMXUTM::TranslationFreshness::FIELD_PREFIX,
+          limit: limit,
+        )
+      end
+
+      def execute(args = {})
+        return if !SiteSetting.content_localization_enabled
+        return if !defined?(::DiscourseAi::Translation) || !::DiscourseAi::Translation.enabled?
+        unless ::DiscourseAi::Translation.respond_to?(:credits_available_for_post_localization?)
+          Rails.logger.warn("discourse-rumx-utm: credits_available_for_post_localization? missing — stale-localization refresh skipped")
+          return
+        end
+
+        targets = ::DiscourseAi::Translation.locales.map { |l| l.to_s.split("_").first }
+        ids = self.class.stale_localization_ids(limit: MAX_PER_RUN * 3, post_ids: args[:post_ids])
+        attempts = 0
+        refreshed = []
+
+        ::PostLocalization.where(id: ids).order(:updated_at, :id).includes(post: :topic).each do |localization|
+          break if attempts >= MAX_PER_RUN
+          post = localization.post
+          next if post.nil? || post.topic.nil?
+          next if !targets.include?(localization.locale.to_s.split("_").first)
+          next if !eligible?(post)
+          break if !::DiscourseAi::Translation.credits_available_for_post_localization?
+
+          attempts += 1
+          begin
+            result = ::DiscourseAi::Translation::PostLocalizer.localize(post, localization.locale)
+            next if result.nil?
+            refreshed << "#{post.id}:#{localization.locale}"
+            MessageBus.publish(
+              "/topic/#{post.topic_id}",
+              { type: :localized, id: post.id },
+              post.topic.secure_audience_publish_messages,
+            )
+          rescue => e
+            Rails.logger.warn(
+              "discourse-rumx-utm: refresh of stale localization failed for post #{post.id} " \
+                "(#{localization.locale}): #{e.class}: #{e.message}",
+            )
+          end
+        end
+
+        if refreshed.any?
+          Rails.logger.info(
+            "discourse-rumx-utm: re-translated #{refreshed.size} stale localization(s) " \
+              "(#{attempts} attempts): #{refreshed.join(", ")}",
+          )
+        end
+        { attempts: attempts, refreshed: refreshed }
+      end
+
+      private
+
+      # Mirrors the non-forced branch of Jobs::DetectTranslatePost.
+      def eligible?(post)
+        topic = post.topic
+        if topic.archetype == Archetype.private_message
+          case SiteSetting.ai_translation_personal_messages
+          when "all" then true
+          when "group" then ::TopicAllowedGroup.exists?(topic_id: topic.id)
+          else false
+          end
+        else
+          ::DiscourseAi::Translation.category_allowed?(topic.category)
+        end
+      end
+    end
+  else
+    Rails.logger.warn("discourse-rumx-utm: discourse-ai not loaded — translation freshness runs with the version check only")
+  end
 
   # Order matters: UTM first (touches author-typed links), then RX-linkify
   # (creates clean, UTM-free identifier links).
