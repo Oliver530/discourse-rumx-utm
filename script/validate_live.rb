@@ -3,27 +3,45 @@
 # after every Discourse core upgrade (pointing at the deployed file), because
 # TopicLinkClickExtension prepends a core model method that core may change.
 #
-#   scp plugin.rb root@<droplet>:/tmp/plugin_new.rb
-#   scp script/validate_live.rb root@<droplet>:/tmp/validate_live.rb
-#   ssh root@<droplet> 'docker cp /tmp/plugin_new.rb app:/tmp/plugin_new.rb;
-#     docker cp /tmp/validate_live.rb app:/tmp/validate_live.rb;
+#   scp -r . root@<droplet>:/tmp/plugin_new          # whole plugin dir (lib/, config/)
+#   ssh root@<droplet> 'docker rm -f x 2>/dev/null; docker cp /tmp/plugin_new app:/tmp/plugin_new;
 #     docker exec app bash -c "cd /var/www/discourse && su discourse -c \
-#       \"bundle exec rails runner -e production /tmp/validate_live.rb\""'
+#       \"PLUGIN_RB=/tmp/plugin_new/plugin.rb bundle exec rails runner -e production /tmp/plugin_new/script/validate_live.rb\""'
 #
 # PLUGIN_RB=/var/www/discourse/plugins/discourse-rumx-utm/plugin.rb validates
-# the deployed file instead. Exit 0 = all checks passed.
+# the deployed tree instead. Exit 0 = all checks passed. lib/**/*.rb next to
+# plugin.rb are loaded first; site settings the running core does not know yet
+# (config/settings.yml of the new version) are stubbed with their defaults.
 #
 # Loads the plugin body into THIS rails-runner process only (the unicorn
 # workers are untouched), stubs `on(...)` so the event handlers can be invoked
 # directly, and touches the DB only inside one transaction that is rolled
 # back. Expect "already initialized constant" warnings: the module is reopened.
-plugin_path = ENV.fetch("PLUGIN_RB", "/tmp/plugin_new.rb")
+plugin_path = ENV.fetch("PLUGIN_RB", "/tmp/plugin_new/plugin.rb")
+plugin_dir = File.dirname(plugin_path)
 src = File.read(plugin_path)
+
+# New-version site settings are not in the running core yet: stub defaults.
+settings_yml = File.join(plugin_dir, "config", "settings.yml")
+if File.exist?(settings_yml)
+  require "yaml"
+  YAML.load_file(settings_yml).each_value do |group|
+    group.each do |name, spec|
+      next if SiteSetting.respond_to?(name)
+      default = spec.is_a?(Hash) ? spec["default"] : spec
+      SiteSetting.define_singleton_method(name) { default }
+      puts "  (stubbed SiteSetting.#{name} = #{default.inspect} — not deployed yet)"
+    end
+  end
+end
+Dir[File.join(plugin_dir, "lib", "**", "*.rb")].sort.each { |f| load f }
 body = src[/after_initialize do\n(.*)\nend\s*\z/m, 1] or raise "could not extract after_initialize body"
 handlers = {}
 ctx = Object.new
 ctx.define_singleton_method(:on) { |evt, &blk| handlers[evt] = blk }
 ctx.define_singleton_method(:register_post_custom_field_type) { |name, type, **opts| ::Post.register_custom_field_type(name, type, **opts) }
+ctx.define_singleton_method(:register_topic_custom_field_type) { |name, type, **opts| ::Topic.register_custom_field_type(name, type, **opts) }
+ctx.define_singleton_method(:reloadable_patch) { |&blk| blk.call(nil) }
 ctx.instance_eval(body, plugin_path, 8)
 
 fails = 0
@@ -318,6 +336,111 @@ if defined?(::DiscourseAi::Translation::LocalizableQuota)
   Discourse.redis.del(key)
 else
   puts "  (discourse-ai not loaded — quota override skipped)"
+end
+
+# ---------- 7. noindex flags (2.5.0) ----------
+puts
+puts "-- noindex flags --"
+ni = ::DiscourseRUMXUTM::Noindex
+ns = ::DiscourseRUMXUTM::NoindexServing
+live_actions = ListController.action_methods.select { |a| a.start_with?("category_") } - ["category_feed"]
+missing = live_actions - ns::CATEGORY_LIST_ACTIONS
+unknown = ns::CATEGORY_LIST_ACTIONS - ListController.action_methods.to_a
+check.("CATEGORY_LIST_ACTIONS covers every live ListController category_* action (except feed)", missing.empty?, missing.inspect)
+check.("CATEGORY_LIST_ACTIONS names only existing actions", unknown.empty?, unknown.inspect)
+plugin_file = File.basename(plugin_path)
+has_cb = ->(klass) { klass._process_action_callbacks.any? { |cb| cb.kind == :after && cb.filter.is_a?(Proc) && cb.filter.source_location&.first.to_s.end_with?(plugin_file) } }
+check.("TopicsController has the plugin after_action", has_cb.(TopicsController))
+check.("ListController has the plugin after_action", has_cb.(ListController))
+check.("Sitemap#sitemap_topics still exists and is private", Sitemap.private_instance_methods.include?(:sitemap_topics))
+check.("SitemapExtension prepended", Sitemap.ancestors.include?(::DiscourseRUMXUTM::SitemapExtension))
+
+resp = ActionDispatch::Response.new
+ns.add_noindex!(resp)
+check.("header: fresh -> noindex", resp.headers["X-Robots-Tag"] == "noindex", resp.headers["X-Robots-Tag"].inspect)
+ns.add_noindex!(resp)
+check.("header: idempotent", resp.headers["X-Robots-Tag"] == "noindex")
+resp2 = ActionDispatch::Response.new
+resp2.headers["X-Robots-Tag"] = "nofollow, nosnippet"
+ns.add_noindex!(resp2)
+check.("header: merges into existing directives", resp2.headers["X-Robots-Tag"] == "nofollow, nosnippet, noindex", resp2.headers["X-Robots-Tag"])
+
+cfg = ni.settings
+now = Time.zone.now
+Row = Struct.new(:topic_id, :about_topic, :words, :last_activity, :views90, :guarded, :flagged)
+dec = ->(*a, exempt: []) { ni.decide(Row.new(*a), cfg, exempt.to_set, now) }
+d = dec.(1, true, 5, now - 3.years, 0, true, false)
+check.("guard beats about", d.flag == false && d.reason == "about" && d.guarded)
+check.("thin: <100 words & >180 d -> flag", (d = dec.(2, false, 50, now - 200.days, 100, false, false)).flag && d.reason == "thin")
+check.("thin needs age (100 d -> no flag)", !dec.(3, false, 50, now - 100.days, 0, false, false).flag)
+check.("stale: >2 y & 4 views -> flag", (d = dec.(4, false, 5000, now - 3.years, 4, false, false)).flag && d.reason == "stale")
+check.("stale: 10 views, not flagged -> no flag", !dec.(5, false, 5000, now - 3.years, 10, false, false).flag)
+check.("hysteresis: 10 views, already flagged -> stays flagged", dec.(6, false, 5000, now - 3.years, 10, false, true).flag)
+check.("hysteresis: 25 views, already flagged -> unflag", !dec.(7, false, 5000, now - 3.years, 25, false, true).flag)
+check.("exempt beats thin", (d = dec.(8, false, 50, now - 3.years, 0, false, false, exempt: [8])).flag == false && d.exempt)
+check.("active topic -> no reason, no flag", (d = dec.(9, false, 5000, now - 1.day, 1000, false, false)).flag == false && d.reason.nil?)
+check.("nil last_activity counts as infinitely old", dec.(10, false, 50, nil, 0, false, false).flag)
+
+t0 = Time.now
+all = ni.decisions(cfg, now: now)
+elapsed = (Time.now - t0).round(1)
+sm = ni.summarize(all)
+check.("decisions() over all public topics (#{all.size}) in #{elapsed}s", all.size > 100 && elapsed < 180)
+puts "  summary: #{sm.inspect}"
+fresh, freshness = ni.data_fresh?
+check.("source data fresh (topic_view_stats, incoming_links)", fresh, freshness.inspect)
+
+ActiveRecord::Base.transaction do
+  probe = Topic.joins(:category).where(archetype: "regular", deleted_at: nil, visible: true).where(categories: { read_restricted: false }).order(:id).first
+  TopicCustomField.where(topic_id: probe.id, name: ni::FIELD).delete_all
+  TopicCustomField.create!(topic_id: probe.id, name: ni::FIELD, value: "t")
+  reloaded = Topic.find(probe.id)
+  check.("flagged? reads the typed boolean custom field", ni.flagged?(reloaded) == true)
+
+  build_ctl = ->(ivar, obj, path) {
+    c = Object.new
+    c.instance_variable_set(ivar, obj)
+    req = ActionDispatch::Request.new(Rack::MockRequest.env_for(path))
+    rs = ActionDispatch::Response.new
+    c.define_singleton_method(:request) { req }
+    c.define_singleton_method(:response) { rs }
+    c
+  }
+  ns.define_singleton_method(:enabled?) { true }
+  c = build_ctl.(:@topic_view, Struct.new(:topic).new(reloaded), "/t/x/#{reloaded.id}")
+  ns.apply_topic!(c)
+  check.("apply_topic!: enabled + flagged -> X-Robots-Tag noindex", c.response.headers["X-Robots-Tag"] == "noindex", c.response.headers["X-Robots-Tag"].inspect)
+  other = Topic.where(archetype: "regular", deleted_at: nil).where.not(id: reloaded.id).order(:id).first
+  c = build_ctl.(:@topic_view, Struct.new(:topic).new(other), "/t/y/#{other.id}")
+  ns.apply_topic!(c)
+  check.("apply_topic!: unflagged topic -> no header", c.response.headers["X-Robots-Tag"].nil?)
+  cat = Category.where(read_restricted: false).order(:id).first
+  ns.define_singleton_method(:category_ids) { [cat.id] }
+  c = build_ctl.(:@category, cat, "/c/#{cat.slug}/#{cat.id}")
+  ns.apply_category!(c)
+  check.("apply_category!: listed category -> header", c.response.headers["X-Robots-Tag"] == "noindex")
+  other_cat = Category.where(read_restricted: false).where.not(id: cat.id).order(:id).first
+  c = build_ctl.(:@category, other_cat, "/c/#{other_cat.slug}/#{other_cat.id}")
+  ns.apply_category!(c)
+  check.("apply_category!: other category -> no header", c.response.headers["X-Robots-Tag"].nil?)
+  ns.define_singleton_method(:enabled?) { false }
+  c = build_ctl.(:@topic_view, Struct.new(:topic).new(reloaded), "/t/x/#{reloaded.id}")
+  ns.apply_topic!(c)
+  check.("apply_topic!: disabled -> no header even when flagged", c.response.headers["X-Robots-Tag"].nil?)
+  ns.singleton_class.send(:remove_method, :enabled?)
+  ns.singleton_class.send(:remove_method, :category_ids)
+
+  smap = Sitemap.find_by(name: "1") || Sitemap.new(name: "1")
+  had_setting = SiteSetting.singleton_methods.include?(:rumx_noindex_enabled)
+  SiteSetting.define_singleton_method(:rumx_noindex_enabled) { false }
+  unfiltered = smap.send(:sitemap_topics).pluck(:id)
+  SiteSetting.define_singleton_method(:rumx_noindex_enabled) { true }
+  filtered = smap.send(:sitemap_topics).pluck(:id)
+  SiteSetting.singleton_class.send(:remove_method, :rumx_noindex_enabled)
+  SiteSetting.define_singleton_method(:rumx_noindex_enabled) { false } unless had_setting || SiteSetting.respond_to?(:rumx_noindex_enabled)
+  check.("sitemap: filtered set == unfiltered − flagged ids (#{unfiltered.size} -> #{filtered.size})",
+         unfiltered.include?(reloaded.id) && filtered.sort == (unfiltered - [reloaded.id]).sort)
+  raise ActiveRecord::Rollback
 end
 
 puts

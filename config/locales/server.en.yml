@@ -1,0 +1,12 @@
+en:
+  site_settings:
+    rumx_noindex_enabled: "Send X-Robots-Tag: noindex for topics flagged by the RumX noindex rules and for the listed categories, and drop flagged topics from the sitemap. Off = dry run (flags are still computed nightly)."
+    rumx_noindex_thin_max_words: "Thin rule: a topic whose regular posts total fewer than this many words counts as thin."
+    rumx_noindex_thin_min_age_days: "Thin rule: only topics without a post or edit for at least this many days are flagged."
+    rumx_noindex_stale_min_age_days: "Stale rule: topics without a post or edit for at least this many days are candidates."
+    rumx_noindex_stale_max_views_90d: "Stale rule: candidates with fewer than this many human page views in the last 90 days are flagged."
+    rumx_noindex_unflag_min_views_90d: "Stale rule hysteresis: an already flagged topic is only unflagged once it has at least this many views in 90 days (or a new post/edit)."
+    rumx_noindex_guard_referrer_domains: "Never flag a topic that received a visit from one of these referrer hosts (or a subdomain) in the last 90 days."
+    rumx_noindex_exempt_topic_ids: "Topic ids that are never flagged, whatever the rules say."
+    rumx_noindex_category_ids: "Category list pages (/c/…) that get X-Robots-Tag: noindex."
+    rumx_noindex_max_new_flags_per_run: "A scheduled run that would add more flags than this holds all additions back and logs a warning (removals still apply)."

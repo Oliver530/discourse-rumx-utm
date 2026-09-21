@@ -1,6 +1,6 @@
 # discourse-rumx-utm
 
-Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
+Discourse plugin for community.rumx.com. `plugin.rb` + `lib/rumx_seo/` (noindex rules), two JS initializers.
 
 ## What it does
 
@@ -69,6 +69,15 @@ The three consumers of the clean RX href shape — the UTM pass (skip), the JS
 rewrite and the click normalizer — key on the same regex. Change one, change
 all three.
 
+6. **Rule-based noindex for stale / thin topics** (v2.5.0). Discourse core
+   has no per-topic noindex. A nightly job (`Jobs::RumxNoindexRecalc`) flags
+   topics as `topic_custom_fields` (`rumx_noindex`, `rumx_noindex_reason`,
+   `rumx_noindex_since`); `TopicsController#show` answers flagged topics with
+   `X-Robots-Tag: noindex` (merged into any existing directives, header only,
+   no meta), listed categories (`rumx_noindex_category_ids`) get the same on
+   their `/c/…` list pages, and flagged topics leave the sitemap. Rules and
+   rationale: `lib/rumx_seo/noindex.rb`; ops: [Noindex flags](#noindex-flags-250).
+
 ## Agent prompts (not in this repo)
 
 Two agent copies on the forum carry prompt fixes; the matching site settings
@@ -86,8 +95,9 @@ Merge to `master`, then **Admin → Upgrade** (`/admin/upgrade`) on the forum:
 docker_manager pulls, precompiles assets, reloads the web server. No container
 rebuild, no downtime.
 
-Before deploying, validate the new `plugin.rb` against the live install —
-`script/validate_live.rb` (usage in its header). It exercises both cook
+Before deploying, validate the new plugin tree against the live install —
+`script/validate_live.rb` (usage in its header; `scp -r` the whole directory,
+it loads `lib/` and stubs not-yet-deployed settings). It exercises both cook
 handlers, idempotence on re-processing, the Market Radar case, the click
 normalizer, and the translation-freshness path end to end with a STUBBED
 translator (real `Jobs::DetectTranslatePost` and reconciler runs, no LLM
@@ -95,8 +105,70 @@ calls, everything inside a rolled-back transaction), plus an exactness check
 of the SQL staleness predicate against a Ruby scan. Run it again after
 Discourse core or discourse-ai upgrades: the plugin prepends core methods
 (`TopicLinkClick.create_from`, `ContentLocalization.show_translated_post?`,
-`DiscourseAi::Translation::PostLocalizer.localize` / `has_relocalize_quota?`)
-and overrides a discourse-ai constant.
+`DiscourseAi::Translation::PostLocalizer.localize` / `has_relocalize_quota?`,
+`Sitemap#sitemap_topics`), adds after_actions to `TopicsController` /
+`ListController` (the script diffs `CATEGORY_LIST_ACTIONS` against the live
+action list) and overrides a discourse-ai constant.
+
+## Noindex flags (2.5.0)
+
+Rules (a topic is flagged when one holds and neither guard nor exemption applies):
+
+| reason | rule | setting |
+|---|---|---|
+| `about` | description topic of its category (`categories.topic_id`) | — |
+| `thin` | words of regular posts < N **and** no post/edit for ≥ D days | `rumx_noindex_thin_max_words` (100), `rumx_noindex_thin_min_age_days` (180) |
+| `stale` | no post/edit for ≥ D days **and** human views in 90 d < V (< `unflag` while already flagged) | `rumx_noindex_stale_min_age_days` (730), `rumx_noindex_stale_max_views_90d` (5), `rumx_noindex_unflag_min_views_90d` (20) |
+| guard | ≥ 1 visit from a search-engine referrer host in 90 d (`incoming_links`) | `rumx_noindex_guard_referrer_domains` |
+| exempt | topic id listed | `rumx_noindex_exempt_topic_ids` |
+
+`rumx_noindex_enabled` (default **off**) gates only the header and the sitemap
+filter; the job always computes and stores flags, so the first deploy is a dry
+run by construction. Every run writes an audit entry to `PluginStore`
+(`discourse-rumx-utm`, key `noindex_run:<iso-ts>`, pointer `noindex_last_run`)
+with settings, freshness, counts, added and removed ids. A scheduled run that
+wants to add more than `rumx_noindex_max_new_flags_per_run` (100) flags holds
+the additions back and logs a warning; removals always apply. A run with stale
+source data (`topic_view_stats` / `incoming_links` older than 2 days) is
+skipped and keeps the previous flags.
+
+Rollout:
+
+```ruby
+# rails runner -e production   (docker exec app su discourse -c "cd /var/www/discourse && bundle exec rails runner -e production /tmp/x.rb")
+Jobs.enqueue(:rumx_noindex_recalc, initial: true)        # first run, drift brake off
+PluginStore.get("discourse-rumx-utm", "noindex_last_run") # -> run id
+PluginStore.get("discourse-rumx-utm", "noindex_run:<run id>")["summary"]
+```
+
+Export for review (Data Explorer, saved as "RumX noindex flags"):
+
+```sql
+SELECT t.id, t.title, t.slug, r.value AS reason, s.value AS since, t.last_posted_at, t.posts_count
+FROM topic_custom_fields f
+JOIN topics t ON t.id = f.topic_id
+LEFT JOIN topic_custom_fields r ON r.topic_id = t.id AND r.name = 'rumx_noindex_reason'
+LEFT JOIN topic_custom_fields s ON s.topic_id = t.id AND s.name = 'rumx_noindex_since'
+WHERE f.name = 'rumx_noindex' AND f.value = 't'
+ORDER BY reason, t.last_posted_at
+```
+
+Review the `about` rows (real category rules/FAQs → exempt) and a sample of
+`thin`/`stale`, add exemptions to `rumx_noindex_exempt_topic_ids`, run the job
+again, then switch `rumx_noindex_enabled` on. Verify with the Googlebot UA:
+
+```bash
+UA='Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)'
+curl -s -A "$UA" -D - -o /dev/null https://community.rumx.com/t/<slug>/<flagged id> | grep -i x-robots        # noindex
+curl -s -A "$UA" -D - -o /dev/null "https://community.rumx.com/t/<slug>/<flagged id>?page=2" | grep -i x-robots
+curl -s -A "$UA" -D - -o /dev/null https://community.rumx.com/t/<slug>/<unflagged id> | grep -i x-robots      # nothing
+curl -s -A "$UA" -D - -o /dev/null https://community.rumx.com/c/marketplace/5 | grep -i x-robots            # nothing
+curl -s -A "$UA" https://community.rumx.com/sitemap_1.xml | grep -c "<loc>"                                  # public topics − flags
+```
+
+Rollback: `rumx_noindex_enabled` off (headers stop with the next request, the
+anonymous page cache is ≤ 1 min); the sitemap cache is invalidated by the job
+whenever flags change and expires after 24 h anyway.
 
 ## After deploying 2.2.0
 

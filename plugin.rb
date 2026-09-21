@@ -1,10 +1,14 @@
 # name: discourse-rumx-utm
-# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh
-# version: 2.4.0
+# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics
+# version: 2.5.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
 register_asset "stylesheets/common/rumx-translation-label.scss"
+
+# Rule-based noindex (X-Robots-Tag) for stale / thin topics — see the module docs.
+require_relative "lib/rumx_seo/noindex"
+require_relative "lib/rumx_seo/noindex_serving"
 
 after_initialize do
   module ::DiscourseRUMXUTM
@@ -633,6 +637,45 @@ after_initialize do
     end
   else
     Rails.logger.warn("discourse-rumx-utm: discourse-ai not loaded — translation freshness runs with the version check only")
+  end
+
+  # ---------------------------------------------------------------------------
+  # Rule-based noindex for stale / thin topics (2.5.0). Rules, thresholds and
+  # rationale: lib/rumx_seo/noindex.rb. The nightly job writes the flags as
+  # topic custom fields; the after_actions below turn them into an
+  # X-Robots-Tag header; SitemapExtension drops flagged topics from the
+  # sitemap. rumx_noindex_enabled=false keeps everything but the header and
+  # the sitemap filter (dry run — review the export first).
+  register_topic_custom_field_type(::DiscourseRUMXUTM::Noindex::FIELD, :boolean)
+  register_topic_custom_field_type(::DiscourseRUMXUTM::Noindex::REASON_FIELD, :string)
+  register_topic_custom_field_type(::DiscourseRUMXUTM::Noindex::SINCE_FIELD, :string)
+
+  reloadable_patch do
+    ::TopicsController.class_eval do
+      after_action(only: [:show]) do |controller|
+        ::DiscourseRUMXUTM::NoindexServing.apply_topic!(controller)
+      end
+    end
+    ::ListController.class_eval do
+      after_action(only: ::DiscourseRUMXUTM::NoindexServing::CATEGORY_LIST_ACTIONS.map(&:to_sym)) do |controller|
+        ::DiscourseRUMXUTM::NoindexServing.apply_category!(controller)
+      end
+    end
+    ::Sitemap.prepend(::DiscourseRUMXUTM::SitemapExtension)
+  end
+
+  # Daily recompute. First run by hand, ignoring the drift brake:
+  #   Jobs.enqueue(:rumx_noindex_recalc, initial: true)
+  # Read-only preview (writes only the audit entry):
+  #   Jobs.enqueue(:rumx_noindex_recalc, dry_run: true)
+  class ::Jobs::RumxNoindexRecalc < ::Jobs::Scheduled
+    every 1.day
+    sidekiq_options retry: false
+    cluster_concurrency 1
+
+    def execute(args = {})
+      ::DiscourseRUMXUTM::Noindex.recalc!(initial: !!args[:initial], dry_run: !!args[:dry_run])
+    end
   end
 
   # Order matters: UTM first (touches author-typed links), then RX-linkify
