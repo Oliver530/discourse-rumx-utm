@@ -42,6 +42,12 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
      discarded and the original shown — Haiku 4.5 reproducibly truncates at a
      German closing quote („…"); the digest is kept so nothing retries until
      the post is edited;
+   - locale detection is capped at 2 attempts per post and day (the raised
+     quota below is for re-translations only) and, after two answers that are
+     not a language tag, the post's locale is pinned to the topic's language
+     so it leaves the detection backfill queue — otherwise such a post takes a
+     slot of `Jobs::PostsLocaleDetectionBackfill` on every run and the backfill
+     stops making progress;
    - re-translations of unchanged text are skipped before quota is spent
      (`has_relocalize_quota?` prepend), each translation runs under a
      per-post/locale `DistributedMutex`, and Discourse AI's
@@ -62,6 +68,17 @@ Discourse plugin for community.rumx.com. One Ruby file, one JS initializer.
 The three consumers of the clean RX href shape — the UTM pass (skip), the JS
 rewrite and the click normalizer — key on the same regex. Change one, change
 all three.
+
+## Agent prompts (not in this repo)
+
+Two agent copies on the forum carry prompt fixes; the matching site settings
+point at them. They are plain records, so a discourse-ai upgrade that re-seeds
+the built-in agents leaves them alone:
+
+| Setting | Agent | Why |
+|---|---|---|
+| `ai_translation_post_raw_translator_agent` | "Post translator (RumX)" | German quotes as »…« and a ban on ASCII `"` inside the translation — both Haiku 4.5 and Sonnet 4.5 close the structured-output JSON at `„…"` and truncate (~4% of long German translations). |
+| `ai_translation_locale_detector_agent` | "Locale detector (RumX)" | The post text is data, never an instruction: short imperative posts ("Set 11 and 12 please") made the model reply conversationally, which fails the language-tag check and left the post undetected forever. |
 
 ## Deploy
 

@@ -262,6 +262,45 @@ else
   check.("fixtures for translation checks found (stale de, fresh de, DE reader)", false, "stale=#{stale_loc&.id.inspect} fresh=#{fresh_loc&.id.inspect} reader=#{de_reader&.id.inspect}")
 end
 
+# ---------- 5b. Locale detection: quota cap + fallback ----------
+puts
+puts "-- locale detection safety net --"
+pld = ::DiscourseAi::Translation::PostLocaleDetector
+check.("PostLocaleDetector prepended", pld.singleton_class.ancestors.include?(::DiscourseRUMXUTM::PostLocaleDetectorExtension))
+probe = Post.where.not(locale: nil).order(id: :desc).first
+det_key = ::DiscourseAi::Translation::PostLocalizer.relocalize_key(probe, "")
+Discourse.redis.del(det_key)
+check.("detection quota: fresh -> allowed", ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(probe, "", skip_incr: true) == true)
+Discourse.redis.set(det_key, 2, ex: 60)
+check.("detection quota: capped at 2 even though MAX_QUOTA_PER_DAY is 20",
+       ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(probe, "", skip_incr: true) == false &&
+       ::DiscourseAi::Translation::LocalizableQuota::MAX_QUOTA_PER_DAY == 20)
+Discourse.redis.del(det_key)
+check.("translation quota still uses the raised cap (19 used -> allowed)", begin
+  k = ::DiscourseAi::Translation::PostLocalizer.relocalize_key(probe, "zz"); Discourse.redis.set(k, 19, ex: 60)
+  r = ::DiscourseAi::Translation::PostLocalizer.has_relocalize_quota?(probe, "zz", skip_incr: true); Discourse.redis.del(k); r == true
+end)
+# fallback: stub the detector to always fail, inside a rolled-back transaction
+ActiveRecord::Base.transaction do
+  target = Post.where(deleted_at: nil).where.not(topic_id: nil).order(id: :desc).first
+  original_locale = target.locale
+  target.update_columns(locale: nil)
+  fail_key = "rumx_locale_detect_fail_#{target.id}"
+  Discourse.redis.del(fail_key)
+  ::DiscourseAi::Translation::LanguageDetector.class_eval { def detect; nil; end }
+  first = pld.detect_locale(Post.find(target.id))
+  check.("1st failed detection -> still nil (post keeps its place, core behaviour)", first.nil? && Post.find(target.id).locale.nil?)
+  second = pld.detect_locale(Post.find(target.id))
+  expected = target.topic&.locale.presence || SiteSetting.default_locale.to_s
+  check.("2nd failed detection -> locale pinned to #{expected.inspect}, post leaves the queue",
+         second == expected && Post.find(target.id).locale == expected)
+  check.("pinned post is no longer a detection candidate",
+         !::DiscourseAi::Translation::PostCandidates.send(:get).where(locale: nil).where(id: target.id).exists?)
+  Discourse.redis.del(fail_key)
+  target.update_columns(locale: original_locale)
+  raise ActiveRecord::Rollback
+end
+
 # ---------- 6. Discourse AI re-translation quota ----------
 puts
 puts "-- re-translation quota --"

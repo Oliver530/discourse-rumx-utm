@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh
-# version: 2.3.0
+# version: 2.4.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -395,12 +395,62 @@ after_initialize do
         translated_raw.to_s.length < MIN_LENGTH_RATIO * source_raw.length
       end
 
+      # Locale DETECTION calls this with a blank locale and shares the same
+      # per-day counter. MAX_QUOTA_PER_DAY is raised to 20 below for
+      # re-translations of edited posts — that must not also multiply the
+      # wasted calls on a post the detector cannot classify. Observed
+      # 2026-09-21: three posts whose detector answer never parsed as a
+      # language tag burned 20 calls each per day AND held the two slots
+      # Jobs::PostsLocaleDetectionBackfill takes per run (it orders by
+      # updated_at DESC and re-selects the same posts), so the detection
+      # backfill made no progress at all. Cap detection at core's original 2.
+      DETECTION_ATTEMPTS_PER_DAY = 2
+
       def has_relocalize_quota?(model, locale, skip_incr: false)
+        if model.is_a?(::Post) && locale.blank?
+          used = Discourse.redis.get(relocalize_key(model, locale)).to_i
+          return false if used >= DETECTION_ATTEMPTS_PER_DAY
+          return super
+        end
+
         if model.is_a?(::Post) && locale.present? &&
              TranslationFreshness.digest_state(model, locale) == true
           return false
         end
         super
+      end
+    end
+
+    # The detector returns nil whenever the model answers conversationally
+    # instead of with a language tag — it reads short, imperative posts ("Set
+    # 11 and 12 please", "Here are some pictures") as instructions addressed to
+    # itself and replies "I don't see any pictures…", which fails
+    # LanguageDetector::LANGUAGE_TAG_REGEXP. PostLocaleDetector then leaves
+    # posts.locale nil, the backfill picks the same post again next run, and
+    # nothing behind it is ever reached. A sharpened detector agent prompt
+    # fixes the common case; this is the net for the rest: after two failures
+    # pin a locale so the post leaves the queue. The topic's own language is a
+    # better guess than the site default — a post that cannot be classified is
+    # usually short, and short posts follow the thread they are in.
+    module PostLocaleDetectorExtension
+      MAX_FAILED_DETECTIONS = 2
+
+      def detect_locale(post)
+        detected = super
+        return detected if detected.present? || post.blank?
+
+        key = "rumx_locale_detect_fail_#{post.id}"
+        failures = Discourse.redis.incr(key)
+        Discourse.redis.expire(key, 30.days.to_i) if failures == 1
+        return nil if failures < MAX_FAILED_DETECTIONS
+
+        fallback = post.topic&.locale.presence || SiteSetting.default_locale.to_s
+        post.update_column(:locale, fallback)
+        Rails.logger.warn(
+          "discourse-rumx-utm: locale detection returned no language tag #{failures}x for post " \
+            "#{post.id} — pinned #{fallback} so it leaves the detection backfill queue",
+        )
+        fallback
       end
     end
   end
@@ -426,6 +476,11 @@ after_initialize do
     ::DiscourseAi::Translation::PostLocalizer.singleton_class.prepend(
       ::DiscourseRUMXUTM::PostLocalizerExtension,
     )
+    if defined?(::DiscourseAi::Translation::PostLocaleDetector)
+      ::DiscourseAi::Translation::PostLocaleDetector.singleton_class.prepend(
+        ::DiscourseRUMXUTM::PostLocaleDetectorExtension,
+      )
+    end
 
     # Discourse AI caps re-translations at MAX_QUOTA_PER_DAY = 2 per post and
     # locale (lib/translation/localizable_quota.rb) — a constant, not a site
