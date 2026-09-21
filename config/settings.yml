@@ -1,0 +1,43 @@
+discourse_rumx_utm:
+  # Rule-based noindex for thin/stale topics (see lib/rumx_seo/noindex.rb).
+  # false = dry run: the nightly job still computes and stores the flags
+  # (topic_custom_fields rumx_noindex*) and the audit entries, but no header
+  # is sent and the sitemap is untouched. Flip to true only after reviewing
+  # the dry-run export.
+  rumx_noindex_enabled:
+    default: false
+  rumx_noindex_thin_max_words:
+    default: 100
+    min: 0
+  rumx_noindex_thin_min_age_days:
+    default: 180
+    min: 1
+  rumx_noindex_stale_min_age_days:
+    default: 730
+    min: 1
+  rumx_noindex_stale_max_views_90d:
+    default: 5
+    min: 0
+  rumx_noindex_unflag_min_views_90d:
+    default: 20
+    min: 0
+  # Exact host or any subdomain of it (host-suffix match, never substring).
+  rumx_noindex_guard_referrer_domains:
+    type: list
+    list_type: simple
+    default: "google.com|google.de|google.fr|google.co.uk|google.at|google.ch|google.nl|google.it|google.es|google.be|bing.com|yahoo.com|duckduckgo.com|yandex.com|yandex.ru|baidu.com|ecosia.org"
+  # Topic ids that are never flagged (manual review + historical GSC clicks).
+  rumx_noindex_exempt_topic_ids:
+    type: list
+    list_type: simple
+    default: ""
+  # Category ids whose list pages get X-Robots-Tag: noindex (explicit list, no threshold rule).
+  rumx_noindex_category_ids:
+    type: category_list
+    default: ""
+  # Drift brake: a scheduled run that wants to ADD more flags than this holds
+  # them all back (removals still happen) and logs a warning. The first run is
+  # started manually with `initial: true`, which ignores the brake.
+  rumx_noindex_max_new_flags_per_run:
+    default: 100
+    min: 0
