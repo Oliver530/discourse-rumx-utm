@@ -78,6 +78,19 @@ all three.
    their `/c/…` list pages, and flagged topics leave the sitemap. Rules and
    rationale: `lib/rumx_seo/noindex.rb`; ops: [Noindex flags](#noindex-flags-250).
 
+7. **Login entry point for anonymous visitors on members-only content**
+   (v2.6.0). Discourse answers a logged-out request for a topic or list page
+   in a private category with a bare 404. For the categories listed in
+   `rumx_anon_login_redirect_category_ids` (marketplace archives, samples,
+   members club — never staff/lounge, whose existence stays hidden) an
+   anonymous HTML request is answered with core `redirect_to_login` (302 to
+   `/login`, `destination_url` cookie keeps post number, `?page=` and UTM;
+   after login the member lands on the requested URL), and an SPA/JSON
+   request with 403 + a translated message; the `exception-wrapper`
+   connector adds a "Log in" button to the Ember error page. Logged-in users
+   and everything outside the allowlist are untouched. Code:
+   `lib/rumx_seo/anon_login_redirect.rb`; ops: [Anon login redirect](#anon-login-redirect-260).
+
 ## Agent prompts (not in this repo)
 
 Two agent copies on the forum carry prompt fixes; the matching site settings
@@ -109,6 +122,29 @@ Discourse core or discourse-ai upgrades: the plugin prepends core methods
 `Sitemap#sitemap_topics`), adds after_actions to `TopicsController` /
 `ListController` (the script diffs `CATEGORY_LIST_ACTIONS` against the live
 action list) and overrides a discourse-ai constant.
+
+## Anon login redirect (2.6.0)
+
+Off until `rumx_anon_login_redirect_category_ids` is set. Live allowlist
+(2026-09-22): `12|13|46|60|61|68` (samples, offering-samples, archive,
+archive-canceled-bottle-splits, archive-other-spirits, wagemut-members-club).
+Do **not** add staff (3), lounge (4) or drafts (44/45): a 302 would reveal that
+a private topic exists. `validate_live.rb` section 8 runs real requests
+through `ActionDispatch::Integration::Session` (anonymous HTML/HEAD/JSON/XHR,
+logged-in admin, empty allowlist) inside a rolled-back transaction.
+
+Verify after deploy (anonymous):
+
+```bash
+UA='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0 Safari/537.36'
+curl -s -A "$UA" -D - -o /dev/null "https://community.rumx.com/c/wagemut-members-club/68?utm_source=rumx&utm_medium=landing&utm_campaign=wagemut-newsletter-2" | grep -iE "^HTTP|^location|destination_url"
+curl -s -A "$UA" -o /dev/null -w "%{http_code}\n" https://community.rumx.com/t/<archive slug>/<id>.json      # 403
+curl -s -A "$UA" -o /dev/null -w "%{http_code}\n" https://community.rumx.com/c/staff/3                        # 404
+```
+
+Browser: open a members-club link logged out → `/login` → sign in → you land on
+the club; from a public thread click an archived bottle-split link → error page
+with the "Log in" button → sign in → thread.
 
 ## Noindex flags (2.5.0)
 

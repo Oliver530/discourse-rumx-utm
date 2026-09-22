@@ -35,6 +35,11 @@ if File.exist?(settings_yml)
   end
 end
 Dir[File.join(plugin_dir, "lib", "**", "*.rb")].sort.each { |f| load f }
+# Server locale keys of the new version (the running core only knows the deployed ones).
+Dir[File.join(plugin_dir, "config", "locales", "server.*.yml")].sort.each do |f|
+  data = YAML.load_file(f)
+  data.each { |locale, tree| I18n.backend.store_translations(locale.to_sym, tree) }
+end
 body = src[/after_initialize do\n(.*)\nend\s*\z/m, 1] or raise "could not extract after_initialize body"
 handlers = {}
 ctx = Object.new
@@ -418,6 +423,8 @@ ActiveRecord::Base.transaction do
     c.define_singleton_method(:response) { rs }
     c
   }
+  orig_ns_enabled = ns.method(:enabled?)
+  orig_ns_category_ids = ns.method(:category_ids)
   ns.define_singleton_method(:enabled?) { true }
   c = build_ctl.(:@topic_view, Struct.new(:topic).new(reloaded), "/t/x/#{reloaded.id}")
   ns.apply_topic!(c)
@@ -439,21 +446,112 @@ ActiveRecord::Base.transaction do
   c = build_ctl.(:@topic_view, Struct.new(:topic).new(reloaded), "/t/x/#{reloaded.id}")
   ns.apply_topic!(c)
   check.("apply_topic!: disabled -> no header even when flagged", c.response.headers["X-Robots-Tag"].nil?)
-  ns.singleton_class.send(:remove_method, :enabled?)
-  ns.singleton_class.send(:remove_method, :category_ids)
+  # restore the ORIGINAL method objects (remove_method would delete them: they live on the same singleton class)
+  ns.define_singleton_method(:enabled?, orig_ns_enabled)
+  ns.define_singleton_method(:category_ids, orig_ns_category_ids)
 
   smap = Sitemap.find_by(name: "1") || Sitemap.new(name: "1")
-  had_setting = SiteSetting.singleton_methods.include?(:rumx_noindex_enabled)
-  SiteSetting.define_singleton_method(:rumx_noindex_enabled) { false }
-  unfiltered = smap.send(:sitemap_topics).pluck(:id)
-  SiteSetting.define_singleton_method(:rumx_noindex_enabled) { true }
-  filtered = smap.send(:sitemap_topics).pluck(:id)
-  SiteSetting.singleton_class.send(:remove_method, :rumx_noindex_enabled)
-  SiteSetting.define_singleton_method(:rumx_noindex_enabled) { false } unless had_setting || SiteSetting.respond_to?(:rumx_noindex_enabled)
-  check.("sitemap: filtered set == unfiltered − flagged ids (#{unfiltered.size} -> #{filtered.size})",
-         unfiltered.include?(reloaded.id) && filtered.sort == (unfiltered - [reloaded.id]).sort)
+  # Toggle the setting reader for this process only and RESTORE the original
+  # method object afterwards (remove_method would delete the real reader that
+  # SiteSetting.setup_methods defined — every later page render would 500).
+  orig_enabled = SiteSetting.method(:rumx_noindex_enabled)
+  begin
+    SiteSetting.define_singleton_method(:rumx_noindex_enabled) { false }
+    unfiltered = smap.send(:sitemap_topics).pluck(:id)
+    SiteSetting.define_singleton_method(:rumx_noindex_enabled) { true }
+    filtered = smap.send(:sitemap_topics).pluck(:id)
+  ensure
+    SiteSetting.define_singleton_method(:rumx_noindex_enabled, orig_enabled)
+  end
+  live_flagged = TopicCustomField.where(name: ni::FIELD, value: "t").pluck(:topic_id)
+  check.("sitemap: filtered set == unfiltered − flagged ids (#{unfiltered.size} -> #{filtered.size}, #{live_flagged.size} flags)",
+         unfiltered.include?(reloaded.id) && !filtered.include?(reloaded.id) && filtered.sort == (unfiltered - live_flagged).sort)
   raise ActiveRecord::Rollback
 end
+
+# ---------- 8. anonymous login entry point (2.6.0) — real requests ----------
+puts
+puts "-- anon login redirect (integration requests) --"
+alr = ::DiscourseRUMXUTM::AnonLoginRedirect
+check.("TopicsController prepended", TopicsController.ancestors.include?(::DiscourseRUMXUTM::TopicsControllerAnonLoginRedirect))
+check.("ListController prepended", ListController.ancestors.include?(::DiscourseRUMXUTM::ListControllerAnonLoginRedirect))
+check.("server message translated en/de/fr", %w[en de fr].all? { |l| I18n.t(alr::MESSAGE_KEY, locale: l) !~ /translation missing/i })
+ALLOW = [12, 13, 46, 60, 61, 68]
+archive_topic = Topic.where(category_id: 46, deleted_at: nil, archetype: "regular").where("posts_count > 3").order(:id).first
+lounge_topic = Topic.where(category_id: 4, deleted_at: nil, archetype: "regular").order(:id).first
+public_topic = Topic.find(8662)
+flagged_topic = Topic.where(id: TopicCustomField.where(name: "rumx_noindex", value: "t").select(:topic_id)).order(:id).first
+raise "fixtures missing" unless archive_topic && lounge_topic && public_topic && flagged_topic
+sess = ActionDispatch::Integration::Session.new(Rails.application)
+sess.host! Discourse.current_hostname
+sess.https!
+Rails.application.env_config["action_dispatch.show_exceptions"] = :none
+get_or_err = ->(path, headers = {}) {
+  begin
+    sess.get path, headers: headers
+    nil
+  rescue => e
+    "#{e.class}: #{e.message[0, 200]} @ #{e.backtrace.grep(/discourse/).first(3).join(" | ")}"
+  end
+}
+rv = ->(path) { path.include?("?") ? "#{path}&rv=#{SecureRandom.hex(4)}" : "#{path}?rv=#{SecureRandom.hex(4)}" }
+orig_alr_category_ids = alr.method(:category_ids)
+alr.define_singleton_method(:category_ids) { ALLOW }
+begin
+  ActiveRecord::Base.transaction do
+    p = rv.(archive_topic.relative_url)
+    sess.get p
+    check.("anon GET archive topic -> 302 /login", sess.response.status == 302 && sess.response.location.end_with?("/login"), "#{sess.response.status} #{sess.response.location}")
+    dest = sess.cookies["destination_url"].to_s
+    check.("destination_url cookie = original URL (path + query kept)", dest.include?(archive_topic.relative_url) && dest.include?("rv="), dest)
+    check.("response not cacheable", sess.response.headers["Cache-Control"].to_s =~ /no-cache|no-store|private/, sess.response.headers["Cache-Control"])
+    sess.get rv.("#{archive_topic.relative_url}?page=2")
+    check.("anon GET ?page=2 -> 302, cookie keeps page=2", sess.response.status == 302 && sess.cookies["destination_url"].to_s.include?("page=2"))
+    sess.get rv.("/t/#{archive_topic.id}/2")
+    check.("anon GET /t/<id>/<post> (no slug) -> 302", sess.response.status == 302, sess.response.status.to_s)
+    sess.head rv.(archive_topic.relative_url)
+    check.("anon HEAD archive topic -> 302", sess.response.status == 302, sess.response.status.to_s)
+    sess.get rv.("#{archive_topic.relative_url}.json")
+    body = sess.response.body.to_s
+    check.("anon GET archive topic .json -> 403 with our message", sess.response.status == 403 && body.include?(I18n.t(alr::MESSAGE_KEY, locale: :en)), "#{sess.response.status} #{body[0, 120]}")
+    sess.get rv.(archive_topic.relative_url), headers: { "X-Requested-With" => "XMLHttpRequest" }
+    check.("anon XHR -> 403 (no redirect for SPA)", sess.response.status == 403, sess.response.status.to_s)
+    sess.get rv.(lounge_topic.relative_url)
+    check.("anon GET lounge topic (not allowlisted) -> 404 unchanged", sess.response.status == 404, sess.response.status.to_s)
+    sess.get rv.("/c/marketplace/offering-samples/13")
+    check.("anon GET restricted category -> 302 /login", sess.response.status == 302 && sess.response.location.end_with?("/login"), "#{sess.response.status} #{sess.response.location}")
+    sess.get "/c/wagemut-members-club/68?utm_source=rumx&utm_medium=landing&utm_campaign=wagemut-newsletter-2&rv=#{SecureRandom.hex(3)}"
+    check.("anon GET wagemut club with UTM -> 302, cookie keeps UTM", sess.response.status == 302 && sess.cookies["destination_url"].to_s.include?("utm_campaign=wagemut-newsletter-2"), sess.cookies["destination_url"].to_s)
+    sess.get rv.("/c/marketplace/archive/46/l/latest")
+    check.("anon GET /c/…/l/latest -> 302", sess.response.status == 302, sess.response.status.to_s)
+    sess.get rv.("/c/marketplace/archive/46.json")
+    check.("anon GET category .json -> 403", sess.response.status == 403, sess.response.status.to_s)
+    sess.get rv.("/c/staff/3")
+    check.("anon GET /c/staff/3 (not allowlisted) -> 404 unchanged", sess.response.status == 404, sess.response.status.to_s)
+    err_public = get_or_err.(rv.(public_topic.relative_url))
+    puts "  !! #{err_public}" if err_public
+    check.("anon GET public topic -> 200, no X-Robots-Tag", sess.response.status == 200 && sess.response.headers["X-Robots-Tag"].nil?, "#{sess.response.status} #{sess.response.headers["X-Robots-Tag"].inspect}")
+    err_flagged = get_or_err.(rv.(flagged_topic.relative_url))
+    puts "  !! #{err_flagged}" if err_flagged
+    check.("anon GET noindex-flagged public topic -> 200 + X-Robots-Tag noindex (v2.5.0 intact)", sess.response.status == 200 && sess.response.headers["X-Robots-Tag"] == "noindex", "#{sess.response.status} #{sess.response.headers["X-Robots-Tag"].inspect}")
+
+    admin = User.where(admin: true, active: true).where("id > 0").order(:id).first
+    token = UserAuthToken.generate!(user_id: admin.id, user_agent: "validate_live", client_ip: "127.0.0.1", path: "/")
+    sess.cookies["_t"] = token.unhashed_auth_token
+    err_admin = get_or_err.(rv.(archive_topic.relative_url))
+    puts "  !! #{err_admin}" if err_admin
+    check.("logged-in admin GET archive topic -> 200 (no redirect)", sess.response.status == 200, sess.response.status.to_s)
+    sess.cookies.delete("_t")
+
+    alr.define_singleton_method(:category_ids) { [] }
+    sess.get rv.(archive_topic.relative_url)
+    check.("allowlist empty -> archive topic 404 as before", sess.response.status == 404, sess.response.status.to_s)
+    raise ActiveRecord::Rollback
+  end
+ensure
+  alr.define_singleton_method(:category_ids, orig_alr_category_ids)
+end
+check.("auth token fixture rolled back", !UserAuthToken.where(user_agent: "validate_live").exists?)
 
 puts
 puts(fails.zero? ? "ALL CHECKS PASSED" : "#{fails} CHECK(S) FAILED")

@@ -1,5 +1,5 @@
 # name: discourse-rumx-utm
-# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics
+# about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics + login entry point for anonymous visitors on members-only content
 # version: 2.5.1
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
@@ -9,6 +9,7 @@ register_asset "stylesheets/common/rumx-translation-label.scss"
 # Rule-based noindex (X-Robots-Tag) for stale / thin topics — see the module docs.
 require_relative "lib/rumx_seo/noindex"
 require_relative "lib/rumx_seo/noindex_serving"
+require_relative "lib/rumx_seo/anon_login_redirect"
 
 after_initialize do
   module ::DiscourseRUMXUTM
@@ -689,6 +690,13 @@ after_initialize do
     def execute(args = {})
       ::DiscourseRUMXUTM::Noindex.recalc!(initial: !!args[:initial], dry_run: !!args[:dry_run])
     end
+  end
+
+  # Anonymous visitors on allowlisted members-only content get a login entry
+  # point instead of a 404 (2.6.0) — see lib/rumx_seo/anon_login_redirect.rb.
+  reloadable_patch do
+    ::TopicsController.prepend(::DiscourseRUMXUTM::TopicsControllerAnonLoginRedirect)
+    ::ListController.prepend(::DiscourseRUMXUTM::ListControllerAnonLoginRedirect)
   end
 
   # Order matters: UTM first (touches author-typed links), then RX-linkify

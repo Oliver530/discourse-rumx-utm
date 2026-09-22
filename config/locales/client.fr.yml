@@ -1,5 +1,8 @@
 fr:
   js:
+    rumx_anon_login:
+      hint: "Ce contenu est réservé aux membres de la communauté RumX. Connecte-toi pour continuer."
+      button: "Se connecter"
     rumx_translation:
       translated_from: "Traduit de %{language}"
       showing_original: "Original (%{language})"
