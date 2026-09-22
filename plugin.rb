@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics + login entry point for anonymous visitors on members-only content
-# version: 2.5.1
+# version: 2.6.0
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
