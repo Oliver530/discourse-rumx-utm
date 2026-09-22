@@ -86,8 +86,10 @@ all three.
    anonymous HTML request is answered with core `redirect_to_login` (302 to
    `/login`, `destination_url` cookie keeps post number, `?page=` and UTM;
    after login the member lands on the requested URL), and an SPA/JSON
-   request with 403 + a translated message; the `exception-wrapper`
-   connector adds a "Log in" button to the Ember error page. Logged-in users
+   request with 403 + a translated message: for topics the
+   `post-stream-error-loading` transformer shows it with core's own "Log in"
+   button, for categories (`find_by_slug` is patched too) the
+   `exception-wrapper__after` connector adds the button to the error page. Logged-in users
    and everything outside the allowlist are untouched. Code:
    `lib/rumx_seo/anon_login_redirect.rb`; ops: [Anon login redirect](#anon-login-redirect-260).
 

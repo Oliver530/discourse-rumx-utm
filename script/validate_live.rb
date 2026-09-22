@@ -475,6 +475,7 @@ puts "-- anon login redirect (integration requests) --"
 alr = ::DiscourseRUMXUTM::AnonLoginRedirect
 check.("TopicsController prepended", TopicsController.ancestors.include?(::DiscourseRUMXUTM::TopicsControllerAnonLoginRedirect))
 check.("ListController prepended", ListController.ancestors.include?(::DiscourseRUMXUTM::ListControllerAnonLoginRedirect))
+check.("CategoriesController prepended", CategoriesController.ancestors.include?(::DiscourseRUMXUTM::CategoriesControllerAnonLoginRedirect))
 check.("server message translated en/de/fr", %w[en de fr].all? { |l| I18n.t(alr::MESSAGE_KEY, locale: l) !~ /translation missing/i })
 ALLOW = [12, 13, 46, 60, 61, 68]
 archive_topic = Topic.where(category_id: 46, deleted_at: nil, archetype: "regular").where("posts_count > 3").order(:id).first
@@ -528,6 +529,10 @@ begin
     check.("anon GET category .json -> 403", sess.response.status == 403, sess.response.status.to_s)
     sess.get rv.("/c/staff/3")
     check.("anon GET /c/staff/3 (not allowlisted) -> 404 unchanged", sess.response.status == 404, sess.response.status.to_s)
+    sess.get rv.("/c/marketplace/offering-samples/find_by_slug.json")
+    check.("anon SPA category lookup find_by_slug -> 403 with our message", sess.response.status == 403 && sess.response.body.include?(I18n.t(alr::MESSAGE_KEY, locale: :en)), sess.response.status.to_s)
+    sess.get rv.("/c/staff/find_by_slug.json")
+    check.("anon find_by_slug on staff -> 404 unchanged", sess.response.status == 404, sess.response.status.to_s)
     err_public = get_or_err.(rv.(public_topic.relative_url))
     puts "  !! #{err_public}" if err_public
     check.("anon GET public topic -> 200, no X-Robots-Tag", sess.response.status == 200 && sess.response.headers["X-Robots-Tag"].nil?, "#{sess.response.status} #{sess.response.headers["X-Robots-Tag"].inspect}")

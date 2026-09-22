@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics + login entry point for anonymous visitors on members-only content
-# version: 2.6.0
+# version: 2.6.1
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -697,6 +697,7 @@ after_initialize do
   reloadable_patch do
     ::TopicsController.prepend(::DiscourseRUMXUTM::TopicsControllerAnonLoginRedirect)
     ::ListController.prepend(::DiscourseRUMXUTM::ListControllerAnonLoginRedirect)
+    ::CategoriesController.prepend(::DiscourseRUMXUTM::CategoriesControllerAnonLoginRedirect)
   end
 
   # Order matters: UTM first (touches author-typed links), then RX-linkify

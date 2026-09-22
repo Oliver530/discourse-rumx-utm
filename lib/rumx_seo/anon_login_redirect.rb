@@ -16,10 +16,13 @@
 #                   destination_url cookie (post number, ?page=, UTM kept),
 #                   marks the response non-cacheable, 302 to /login. After
 #                   login auth-complete.js returns to the original URL.
-#   JSON / XHR   -> Discourse::InvalidAccess with our own message: core
-#                   renders 403 with extras.html, the Ember exception page
-#                   shows it, and the exception-wrapper connector adds a
-#                   "Log in" button (the login route remembers the referrer).
+#   JSON / XHR   -> Discourse::InvalidAccess with our own message (403).
+#                   Topics: the post-stream-error-loading transformer
+#                   (initializers/rumx-anon-login.js) shows the message with
+#                   core's own "Log in" button. Categories: SPA navigation
+#                   resolves /c/…/find_by_slug first, so that action is
+#                   patched too; the exception page then carries the message
+#                   and the exception-wrapper__after connector adds the button.
 # Everything else is untouched: logged-in users (with or without access),
 # categories outside the allowlist (existence stays hidden: 404), deleted
 # topics (core permalink path), PMs, other request methods.
@@ -69,6 +72,21 @@ module ::DiscourseRUMXUTM
             ::DiscourseRUMXUTM::AnonLoginRedirect.intercept!(self)
             return
           end
+        end
+      end
+      super
+    end
+  end
+
+  # SPA category navigation resolves the category through
+  # CategoriesController#find_by_slug (JSON) before any list request.
+  module CategoriesControllerAnonLoginRedirect
+    def find_by_slug
+      if ::DiscourseRUMXUTM::AnonLoginRedirect.candidate_request?(self)
+        category = Category.find_by_slug_path(params.require(:category_slug).split("/"))
+        if category && ::DiscourseRUMXUTM::AnonLoginRedirect.category_ids.include?(category.id) &&
+             !guardian.can_see?(category)
+          raise Discourse::InvalidAccess.new("login required", nil, custom_message: ::DiscourseRUMXUTM::AnonLoginRedirect::MESSAGE_KEY)
         end
       end
       super
