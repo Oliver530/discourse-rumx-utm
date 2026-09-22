@@ -44,6 +44,11 @@ ctx.define_singleton_method(:register_topic_custom_field_type) { |name, type, **
 ctx.define_singleton_method(:reloadable_patch) { |&blk| blk.call(nil) }
 ctx.instance_eval(body, plugin_path, 8)
 
+# Mark every log line this script provokes, so a later health check can tell
+# test output from a real incident (see TranslationFreshness.log_prefix).
+Thread.current[:rumx_validation_run] = true
+at_exit { Thread.current[:rumx_validation_run] = nil }
+
 fails = 0
 check = ->(name, cond, extra = nil) {
   puts "#{cond ? 'PASS' : 'FAIL'}  #{name}#{extra ? "  -> #{extra}" : ''}"
@@ -179,7 +184,14 @@ if stale_loc && fresh_loc && de_reader
     check.("serializer serves the ORIGINAL cooked for stale, is_localized=false", json[:cooked] == sp.cooked && json[:cooked] != stale_loc.cooked && json[:is_localized] == false)
     check.("legacy fresh (version equal, no digest): shown", ::ContentLocalization.show_translated_post?(fp, reader) == true)
     check.("serializer serves the TRANSLATION for fresh", PostSerializer.new(fp, scope: reader, root: false).as_json[:cooked] == fresh_loc.cooked)
-    check.("author sees the translation too (no author exemption — core behaviour kept)", ::ContentLocalization.show_translated_post?(fp, Guardian.new(fp.user)) == true)
+    # No author exemption: the plugin must answer exactly what core answers for
+    # the author. Comparing against `true` was wrong — core itself returns
+    # false when the author understands the post's language or has automatic
+    # translation off, which is a property of whichever author the fixture
+    # query happens to pick (2026-09-22: CalDon, understood_languages en+fr).
+    author_scope = Guardian.new(fp.user)
+    check.("no author exemption: plugin matches core for the author",
+           ::ContentLocalization.show_translated_post?(fp, author_scope) == core_show.call(fp, author_scope))
     check.("anonymous DE reader: stale hidden, fresh shown", ::ContentLocalization.show_translated_post?(sp, Guardian.new) == false && ::ContentLocalization.show_translated_post?(fp, Guardian.new) == true)
   end
   I18n.with_locale(:en) do

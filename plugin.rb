@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics
-# version: 2.5.0
+# version: 2.5.1
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -271,6 +271,17 @@ after_initialize do
         "rumx_localize_#{post.id}_#{locale}"
       end
 
+      # script/validate_live.rb exercises the guard and the detection fallback
+      # with stubbed translators, in a rolled-back transaction, against the
+      # production database — and their Rails.logger.warn lines then sit in the
+      # production log looking exactly like real incidents. (2026-09-22: three
+      # "translation … discarded" and three "pinned …" lines cost a full health
+      # check to trace back to T6 fixtures.) The script sets this flag, so the
+      # lines stay visible but are unmistakably test output.
+      def self.log_prefix
+        Thread.current[:rumx_validation_run] ? "[validate_live] " : ""
+      end
+
       # Preload-safe: TopicView hands posts a PreloadedProxy that RAISES for
       # any key outside the allowlist (an admin-made localization in a locale
       # that is not a configured one, say). Unknown means "no digest" — the
@@ -383,7 +394,8 @@ after_initialize do
           TranslationFreshness.record!(post, localization.locale, source_digest)
           if implausibly_short?(source_raw, localization.raw)
             Rails.logger.warn(
-              "discourse-rumx-utm: translation of post #{post.id} to #{localization.locale} is " \
+              "#{TranslationFreshness.log_prefix}discourse-rumx-utm: translation of post " \
+                "#{post.id} to #{localization.locale} is " \
                 "#{localization.raw.to_s.length}/#{source_raw.length} chars of the source — discarded, " \
                 "readers see the original until the post is edited",
             )
@@ -451,7 +463,8 @@ after_initialize do
         fallback = post.topic&.locale.presence || SiteSetting.default_locale.to_s
         post.update_column(:locale, fallback)
         Rails.logger.warn(
-          "discourse-rumx-utm: locale detection returned no language tag #{failures}x for post " \
+          "#{TranslationFreshness.log_prefix}discourse-rumx-utm: locale detection returned no " \
+            "language tag #{failures}x for post " \
             "#{post.id} — pinned #{fallback} so it leaves the detection backfill queue",
         )
         fallback
