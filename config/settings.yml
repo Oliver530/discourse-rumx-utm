@@ -41,3 +41,10 @@ discourse_rumx_utm:
   rumx_noindex_max_new_flags_per_run:
     default: 100
     min: 0
+  # Login entry point for anonymous visitors on members-only content
+  # (lib/rumx_seo/anon_login_redirect.rb). Empty = off. Only list categories
+  # whose existence is public (marketplace archives, members club); private
+  # staff/lounge areas must stay 404.
+  rumx_anon_login_redirect_category_ids:
+    type: category_list
+    default: ""

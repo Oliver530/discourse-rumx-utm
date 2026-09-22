@@ -1,5 +1,8 @@
 de:
   js:
+    rumx_anon_login:
+      hint: "Dieser Inhalt ist nur für Mitglieder der RumX Community. Melde dich an, um fortzufahren."
+      button: "Anmelden"
     rumx_translation:
       translated_from: "Übersetzt aus %{language}"
       showing_original: "Original (%{language})"
