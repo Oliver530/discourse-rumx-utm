@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics + login entry point for anonymous visitors on members-only content
-# version: 2.6.1
+# version: 2.6.2
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -698,6 +698,33 @@ after_initialize do
     ::TopicsController.prepend(::DiscourseRUMXUTM::TopicsControllerAnonLoginRedirect)
     ::ListController.prepend(::DiscourseRUMXUTM::ListControllerAnonLoginRedirect)
     ::CategoriesController.prepend(::DiscourseRUMXUTM::CategoriesControllerAnonLoginRedirect)
+  end
+
+  # Manual "translate post" on a topic's FIRST post (2.6.2). Core's composer
+  # (services/composer.js saveTranslation) saves the post translation, then
+  # always POSTs the title translation too — with whatever is in the title
+  # field. That field starts EMPTY whenever the topic has no localization in
+  # the chosen locale (typical: the topic's own locale is that language, so
+  # there is nothing to prefill), and it shows the original title as a grey
+  # placeholder, so it looks filled. The controller then fails
+  # params.require(:title) → 400 "param is missing … title" → error dialog,
+  # although the post translation had just been saved. (2026-09-30: every
+  # save of a split host on /t/34495 hit this.) A blank title means "leave the
+  # title alone": same permission check as core, then a no-op success.
+  module ::DiscourseRUMXUTM::TopicLocalizationsControllerBlankTitle
+    def create_or_update
+      if params[:title].blank? && params[:topic_id].present? && params[:locale].present?
+        topic = ::Topic.find_by(id: params[:topic_id])
+        raise ::Discourse::NotFound unless topic
+        guardian.ensure_can_localize_topic!(topic)
+        return render json: success_json, status: :ok
+      end
+      super
+    end
+  end
+
+  reloadable_patch do
+    ::TopicLocalizationsController.prepend(::DiscourseRUMXUTM::TopicLocalizationsControllerBlankTitle)
   end
 
   # Order matters: UTM first (touches author-typed links), then RX-linkify
