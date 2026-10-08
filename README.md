@@ -125,6 +125,19 @@ Discourse core or discourse-ai upgrades: the plugin prepends core methods
 `ListController` (the script diffs `CATEGORY_LIST_ACTIONS` against the live
 action list) and overrides a discourse-ai constant.
 
+`validate_live.rb` covers the server only. The client replaces core's
+`PostStream#triggerChangedPost` (`rumx-localized-refresh.js`), so after every
+deploy and every Discourse upgrade run this in the browser console of any open
+topic (two `GET /posts/:id`, nothing is written). Both lines must resolve
+without an error; 2.6.4 threw on the first one, and open topics stopped
+showing edits, rebakes and post actions until reload.
+
+```js
+const ps = Discourse.__container__.lookup("controller:topic").model.postStream;
+await ps.triggerChangedPost(ps.posts[0].id, new Date(Date.now() + 1000).toISOString()); // revised/rebaked/acted → core
+await ps.triggerChangedPost(ps.posts[0].id); // localized → re-fetch
+```
+
 ## Anon login redirect (2.6.0)
 
 Off until `rumx_anon_login_redirect_category_ids` is set. Live allowlist

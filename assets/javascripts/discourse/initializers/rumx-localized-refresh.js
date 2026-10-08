@@ -1,48 +1,37 @@
 import { withPluginApi } from "discourse/lib/plugin-api";
+import PostStream from "discourse/models/post-stream";
 
-// Open topics never switched a post to its translation when it arrived.
+// A finished translation arrives on /topic/:id as { type: "localized", id }
+// without updated_at (discourse-ai DetectTranslatePost, core
+// ProcessLocalizedCooked, our reconciler). discourse-ai's callback passes that
+// on as triggerChangedPost(id, undefined), and core refreshes only for a
+// timestamp newer than the loaded post's, so open topics never swapped in the
+// translation. A call without timestamp therefore re-fetches the post; every
+// other call goes to core unchanged. Drop this once upstream sends a timestamp.
 //
-// Discourse AI (Jobs::DetectTranslatePost) and our reconciler
-// (Jobs::RumxRefreshStaleLocalizations) announce a finished translation on
-// /topic/:id as { type: "localized", id } — WITHOUT updated_at. Discourse AI's
-// client callback passes that missing value on to
-// postStream.triggerChangedPost(id, undefined), and core only refreshes when
-// comparePostTimestamps(candidate, existing.updated_at) > 0: an invalid
-// candidate against a valid reference returns -1, so the refresh never ran.
-// (A translation also does not touch post.updated_at, so sending the post's
-// timestamp would not help either.)
-//
-// Effect (2026-10-08, reported by a member): a reply that arrives live in an
-// open topic stays in its original language until the page is reloaded, while
-// the DE translation existed 3 s after posting (279/279 checked). Same after
-// an edit: the stale translation is hidden, the fresh one never swapped in.
-//
-// Fix: a changed-post trigger without a timestamp means "something about this
-// post changed, re-fetch it". Only the localized callback calls it that way;
-// every core caller passes the post's updated_at and keeps core behaviour.
-//
-// Uses addModelMethod (modifyClass on "model:*" is deprecated since 2026.8,
-// discourse.modify-class-model). addModelMethod installs the method in a
-// subclass without `super`, so the core implementation is reached by walking
-// the prototype chain past our own function.
-function triggerChangedPost(postId, updatedAt, opts = {}) {
-  if (updatedAt == null && this.findLoadedPost(postId)) {
-    return this.refreshPost(postId, opts);
-  }
-
-  let proto = Object.getPrototypeOf(this);
-  while (proto && proto.triggerChangedPost === triggerChangedPost) {
-    proto = Object.getPrototypeOf(proto);
-  }
-  return proto.triggerChangedPost.call(this, postId, updatedAt, opts);
-}
-
+// addModelMethod replaces the prototype method and offers no `super`, so the
+// core implementation is captured first. 2.6.4 searched the prototype chain
+// for it instead, found nothing and threw on every revised/rebaked/acted
+// message, so open topics stopped showing edits, rebakes and post actions.
 export default {
   name: "rumx-localized-refresh",
 
   initialize() {
     withPluginApi((api) => {
-      api.addModelMethod("post-stream", "triggerChangedPost", triggerChangedPost);
+      const coreTriggerChangedPost = PostStream.prototype.triggerChangedPost;
+
+      api.addModelMethod(
+        "post-stream",
+        "triggerChangedPost",
+        function (postId, updatedAt, opts) {
+          if (updatedAt == null) {
+            // Nobody awaits this (discourse-ai drops the promise); core's own
+            // message handlers swallow failed refreshes the same way.
+            return this.refreshPost(postId, opts).catch(() => {});
+          }
+          return coreTriggerChangedPost.call(this, postId, updatedAt, opts);
+        }
+      );
     });
   },
 };
