@@ -20,23 +20,29 @@ import { withPluginApi } from "discourse/lib/plugin-api";
 // Fix: a changed-post trigger without a timestamp means "something about this
 // post changed, re-fetch it". Only the localized callback calls it that way;
 // every core caller passes the post's updated_at and keeps core behaviour.
+//
+// Uses addModelMethod (modifyClass on "model:*" is deprecated since 2026.8,
+// discourse.modify-class-model). addModelMethod installs the method in a
+// subclass without `super`, so the core implementation is reached by walking
+// the prototype chain past our own function.
+function triggerChangedPost(postId, updatedAt, opts = {}) {
+  if (updatedAt == null && this.findLoadedPost(postId)) {
+    return this.refreshPost(postId, opts);
+  }
+
+  let proto = Object.getPrototypeOf(this);
+  while (proto && proto.triggerChangedPost === triggerChangedPost) {
+    proto = Object.getPrototypeOf(proto);
+  }
+  return proto.triggerChangedPost.call(this, postId, updatedAt, opts);
+}
+
 export default {
   name: "rumx-localized-refresh",
 
   initialize() {
     withPluginApi((api) => {
-      api.modifyClass(
-        "model:post-stream",
-        (Superclass) =>
-          class extends Superclass {
-            triggerChangedPost(postId, updatedAt, opts = {}) {
-              if (updatedAt == null && this.findLoadedPost(postId)) {
-                return this.refreshPost(postId, opts);
-              }
-              return super.triggerChangedPost(postId, updatedAt, opts);
-            }
-          }
-      );
+      api.addModelMethod("post-stream", "triggerChangedPost", triggerChangedPost);
     });
   },
 };
