@@ -334,12 +334,85 @@ after_initialize do
     # this predicate, so the UI stays consistent: an unshown translation also
     # shows no language icon. Not covered on purpose: topic-list excerpts and
     # e-mails read the topic localization / post directly in core.
+    # Topic titles, same idea (2.6.5). Discourse AI re-translates a changed
+    # title only [editing_grace_period, 5 min].max after the edit, and core
+    # shows the OLD translated title until then. Observed 2026-10-10: a split
+    # host renamed "PRESplit …" to "[VERTEILT] …" at 14:35:50, the DE title
+    # followed at 14:40:56; in between he (DE reader) kept seeing "PRESplit"
+    # and saved the title three times. Each AI title translation records an
+    # MD5 of the title it translated (topic custom field per locale); a
+    # mismatch means "title changed since" and the original title is shown
+    # until the re-translation lands. Titles translated before 2.6.5, and
+    # manual title translations, carry no digest and keep core behaviour.
+    # The excerpt shares the topic localization and follows the same switch.
+    module TitleFreshness
+      FIELD_PREFIX = "rumx_title_src_md5_"
+
+      def self.field_name(locale)
+        "#{FIELD_PREFIX}#{locale.to_s.sub("-", "_")}"
+      end
+
+      # Topic lists preload custom fields from an allowlist and RAISE for any
+      # other key; unknown means "no digest" = core behaviour.
+      def self.stored_digest(topic, locale)
+        name = field_name(locale)
+        return nil if topic.custom_fields_preloaded? && !topic.custom_field_preloaded?(name)
+        value = topic.custom_fields[name]
+        value = value.first if value.is_a?(Array)
+        value.presence
+      rescue ::HasCustomFields::NotPreloadedError
+        nil
+      end
+
+      def self.fresh?(topic, localization)
+        stored = stored_digest(topic, localization.locale)
+        stored.nil? || stored == TranslationFreshness.digest(topic.title)
+      end
+
+      # Direct row write, see TranslationFreshness.record! for why.
+      def self.record!(topic, locale, digest_value)
+        name = field_name(locale)
+        rows = ::TopicCustomField.where(topic_id: topic.id, name: name).order(:id).to_a
+        keep = rows.shift || ::TopicCustomField.new(topic_id: topic.id, name: name)
+        rows.each(&:destroy!)
+        keep.value = digest_value
+        keep.save!
+        topic.clear_custom_fields unless topic.custom_fields_preloaded?
+      end
+    end
+
+    module TopicLocalizerExtension
+      def localize(topic, target_locale = I18n.locale, **kwargs)
+        return super if topic.blank?
+
+        ::DistributedMutex.synchronize(
+          "rumx_localize_topic_#{topic.id}_#{target_locale.to_s.sub("-", "_")}",
+          validity: PostLocalizerExtension::LOCK_VALIDITY_SECONDS,
+        ) do
+          topic.reload
+          source_digest = TranslationFreshness.digest(topic.title)
+          localization = super(topic, target_locale, **kwargs)
+          TitleFreshness.record!(topic, localization.locale, source_digest) if localization.respond_to?(:locale)
+          localization
+        end
+      end
+    end
+
     module ContentLocalizationExtension
       def show_translated_post?(post, scope)
         return false unless super
 
         localization = post.get_localization
         return false if localization && !TranslationFreshness.fresh?(post, localization)
+
+        true
+      end
+
+      def show_translated_topic?(topic, scope)
+        return false unless super
+
+        localization = topic.get_localization
+        return false if localization && !TitleFreshness.fresh?(topic, localization)
 
         true
       end
@@ -484,6 +557,11 @@ after_initialize do
   ::DiscourseRUMXUTM::TranslationFreshness.supported_locales.each do |locale|
     register_post_custom_field_type(::DiscourseRUMXUTM::TranslationFreshness.field_name(locale), :string)
   end
+  ::DiscourseRUMXUTM::TranslationFreshness.supported_locales.each do |locale|
+    name = ::DiscourseRUMXUTM::TitleFreshness.field_name(locale)
+    register_topic_custom_field_type(name, :string)
+    add_preloaded_topic_list_custom_field(name)
+  end
   ::TopicView.add_post_custom_fields_allowlister do |_user, _topic|
     ::DiscourseRUMXUTM::TranslationFreshness.supported_locales.map do |locale|
       ::DiscourseRUMXUTM::TranslationFreshness.field_name(locale)
@@ -494,6 +572,11 @@ after_initialize do
     ::DiscourseAi::Translation::PostLocalizer.singleton_class.prepend(
       ::DiscourseRUMXUTM::PostLocalizerExtension,
     )
+    if defined?(::DiscourseAi::Translation::TopicLocalizer)
+      ::DiscourseAi::Translation::TopicLocalizer.singleton_class.prepend(
+        ::DiscourseRUMXUTM::TopicLocalizerExtension,
+      )
+    end
     if defined?(::DiscourseAi::Translation::PostLocaleDetector)
       ::DiscourseAi::Translation::PostLocaleDetector.singleton_class.prepend(
         ::DiscourseRUMXUTM::PostLocaleDetectorExtension,
