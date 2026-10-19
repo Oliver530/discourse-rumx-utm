@@ -47,6 +47,7 @@ ctx.define_singleton_method(:on) { |evt, &blk| handlers[evt] = blk }
 ctx.define_singleton_method(:register_post_custom_field_type) { |name, type, **opts| ::Post.register_custom_field_type(name, type, **opts) }
 ctx.define_singleton_method(:register_topic_custom_field_type) { |name, type, **opts| ::Topic.register_custom_field_type(name, type, **opts) }
 ctx.define_singleton_method(:reloadable_patch) { |&blk| blk.call(nil) }
+ctx.define_singleton_method(:add_preloaded_topic_list_custom_field) { |field| ::TopicList.preloaded_custom_fields << field }
 ctx.instance_eval(body, plugin_path, 8)
 
 # Mark every log line this script provokes, so a later health check can tell
@@ -560,4 +561,8 @@ check.("auth token fixture rolled back", !UserAuthToken.where(user_agent: "valid
 
 puts
 puts(fails.zero? ? "ALL CHECKS PASSED" : "#{fails} CHECK(S) FAILED")
-exit(fails.zero? ? 0 : 1)
+# exit! skips the runner's ExecutionWrapper: Rails 8.1 reports the SystemExit
+# from plain exit and its error reporter crashes on the ExecutionContext the
+# integration session above left behind, turning a pass into exit 1.
+$stdout.flush
+exit!(fails.zero? ? 0 : 1)
