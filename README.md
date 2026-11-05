@@ -21,7 +21,10 @@ Discourse plugin for community.rumx.com. `plugin.rb` + `lib/rumx_seo/` (noindex 
 4. **UTM on author-typed external links** (`utm_source=rumx`,
    `utm_medium=referral`, `utm_campaign=rumx-forum`). rumx.com links that
    already carry UTM keep theirs (the Market Radar bot tags its own
-   campaign); missing keys are filled, never replaced.
+   campaign); missing keys are filled, never replaced. catawiki.com links get
+   Catawiki's own parameters instead (`utm_source=coop`,
+   `utm_medium=affiliate`, `utm_content=Rumx`, `utm_campaign=Rum-DE|FR|IT|ENG`
+   by path language); links already tagged `coop` stay as they are.
 5. **AI translations stay fresh** (v2.2.0). Core shows a stored translation
    with no check that it still matches the post, Discourse AI re-translates at
    most twice a day per post and locale, and its backfill never refreshes an

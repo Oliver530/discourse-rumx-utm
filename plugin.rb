@@ -1,6 +1,6 @@
 # name: discourse-rumx-utm
 # about: Linkifies RXID codes to rumx.com (server-side, crawlable; viewer-locale aware client-side) + adds UTM to external links + keeps AI translations fresh + rule-based noindex for stale/thin topics + login entry point for anonymous visitors on members-only content
-# version: 2.6.5
+# version: 2.6.6
 # authors: Oliver Gerhardt
 # url: https://github.com/Oliver530/discourse-rumx-utm
 
@@ -156,6 +156,12 @@ after_initialize do
           # only utm_content behind, so GA4 never saw the Market Radar traffic
           # as such. Fill in whatever is missing, never replace what is there.
           params = forum_utm.merge(params)
+        elsif catawiki?(uri)
+          # Catawiki counts RumX traffic by its own parameters, and we agreed in
+          # April 2025 to use only those. A link already tagged by Catawiki
+          # keeps its campaign (Rum-*, Exclusive Rum-*, seller-campaign).
+          return url if params["utm_source"] == "coop"
+          params.merge!(catawiki_utm(uri))
         else
           # External shops: the forum is the referrer, forum attribution wins.
           params.merge!(forum_utm)
@@ -164,6 +170,22 @@ after_initialize do
         uri.to_s
       rescue StandardError
         url
+      end
+
+      def self.catawiki?(uri)
+        uri.host.to_s.downcase.match?(/(\A|\.)catawiki\.com\z/)
+      end
+
+      # Same values as Catawiki's feed; the campaign follows the language in the
+      # path, and every other language counts as English.
+      def self.catawiki_utm(uri)
+        language = uri.path.to_s[%r{\A/([a-z]{2})(?:/|\z)}, 1]
+        {
+          "utm_content"  => "Rumx",
+          "utm_source"   => "coop",
+          "utm_medium"   => "affiliate",
+          "utm_campaign" => { "de" => "Rum-DE", "fr" => "Rum-FR", "it" => "Rum-IT" }.fetch(language, "Rum-ENG")
+        }
       end
 
       # Canonicalize author-typed rumx.com links to match the site's canonical
